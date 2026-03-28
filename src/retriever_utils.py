@@ -108,67 +108,71 @@ def search_semantic_scholar(
     use_cache: bool = True,
 ) -> list[Paper]:
     """
-    Search Semantic Scholar for papers matching the query.
+    Search Semantic Scholar via direct HTTP request (avoids pagination bug).
     Returns a list of Paper objects sorted by hybrid_score descending.
-    Rate limit: 100 req/5 min (with key), ~10/min (without).
-    sleep(3) is applied on every call to stay safe.
     """
-    cache_key = _cache_key(f"s2_{query}_{limit}")
+    cache_key = _cache_key(f"s2v2_{query}_{limit}")
     if use_cache:
         cached = _cache_get(cache_key)
         if cached:
             logger.info(f"S2 cache hit: {query[:50]}")
             return [Paper(**p) for p in cached]
 
+    import requests
+
     s2_key = os.getenv("S2_API_KEY")
+    headers = {"x-api-key": s2_key} if s2_key else {}
+
+    params = {
+        "query": query,
+        "limit": limit,
+        "fields": "title,abstract,year,citationCount,authors,references,paperId",
+    }
+
+    time.sleep(3)  # rate limit guard
 
     try:
-        import semanticscholar as ss
-        if s2_key:
-            sch = ss.SemanticScholar(api_key=s2_key)
-        else:
-            sch = ss.SemanticScholar()
-
-        time.sleep(3)  # rate limit guard — always
-
-        results = sch.search_paper(
-            query,
-            limit=limit,
-            fields=["title", "abstract", "year", "citationCount",
-                    "authors", "references", "paperId"],
+        response = requests.get(
+            "https://api.semanticscholar.org/graph/v1/paper/search",
+            headers=headers,
+            params=params,
+            timeout=15,
         )
-
+        response.raise_for_status()
+        data = response.json()
     except Exception as e:
         logger.warning(f"S2 search failed for '{query}': {e}")
         return []
 
-    if not results:
+    raw_papers = data.get("data", [])
+    if not raw_papers:
         return []
 
-    # Embed query once, then score all abstracts
     embedder = get_embedder()
     query_vec = embedder.encode([query])
 
     papers = []
-    for r in results:
-        if not r.abstract:
-            continue
-
-        abstract_vec = embedder.encode([r.abstract])
+    for r in raw_papers:
+        abstract = r.get("abstract") or ""
+        if not abstract:
+            abstract = r.get("title") or "No abstract available"
+        abstract_vec = embedder.encode([abstract])
         sim = float(cosine_similarity(query_vec, abstract_vec)[0][0])
 
-        year = r.year or 0
-        citations = r.citationCount or 0
-        authors = [a["name"] for a in (r.authors or [])]
-        references = [ref["paperId"] for ref in (r.references or [])
-                      if ref.get("paperId")]
+        year = r.get("year") or 0
+        citations = r.get("citationCount") or 0
+        authors = [a["name"] for a in r.get("authors") or []]
+        references = [
+            ref["paperId"] for ref in (r.get("references") or [])
+            if ref.get("paperId")
+        ]
 
         paper = Paper(
-            title=r.title or "Untitled",
-            abstract=r.abstract,
+            title=r.get("title") or "Untitled",
+            abstract=abstract,
             year=year,
             citation_count=citations,
-            paper_id=r.paperId or "",
+            paper_id=r.get("paperId") or "",
             authors=authors,
             references=references,
             hybrid_score=hybrid_score(sim, year, citations, decay_config),
