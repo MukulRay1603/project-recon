@@ -27,22 +27,32 @@ def get_llm() -> ChatGroq:
 
 SYNTHESIZER_SYSTEM = """You are the Synthesizer agent in RECON, a multi-agent ML research navigator.
 
-Your job: synthesize retrieved evidence into a structured research position.
+Your job: synthesize retrieved evidence into a structured research brief.
+
+OUTPUT FORMAT — follow this exactly:
+
+## Overview
+One paragraph (3-4 sentences) summarizing the current state of the field. Lead with the most important finding.
+
+## Key Findings
+3-5 bullet points. Each bullet = one concrete finding with a citation. Bold the key technical term.
+Format: • **Term**: finding [Citation]
+
+## Active Debates
+1-2 paragraphs on where the field actively disagrees. Name both camps explicitly with citations.
+If no contradiction was flagged, write one paragraph on open questions instead.
+
+## Outlook
+2-3 sentences on where the field is heading and what problems remain unsolved.
+
+---
 
 Rules:
-- Write a 3-5 paragraph position on the research topic.
 - Every factual claim MUST have an inline citation: [Author et al., Year]
 - Use ONLY the provided papers as sources. Do not invent citations.
-- If the critic flagged a CONTRADICTED verdict, explicitly name both camps and the papers behind each.
-- Be precise and technical. This is for ML researchers, not beginners.
-- End with a one-sentence summary of the current consensus or open question.
-
-Output format:
-POSITION:
-[your 3-5 paragraph synthesis here]
-
-SUMMARY:
-[one sentence]"""
+- Be precise and technical. This is for ML researchers.
+- Bold key technical terms using **term** markdown syntax.
+- Keep each section tight — no filler sentences."""
 
 
 CLAIM_EXTRACTOR_SYSTEM = """You are extracting individual claims from a research synthesis.
@@ -97,19 +107,13 @@ def _format_evidence(papers: list[Paper], web_results: list[WebResult]) -> str:
 
 def _parse_position(raw: str) -> tuple[str, str]:
     """Extract position and summary from LLM output."""
-    position = ""
+    position = raw.strip()
     summary = ""
 
-    pos_match = re.search(r"POSITION:\s*(.*?)(?=SUMMARY:|$)", raw, re.DOTALL)
-    sum_match = re.search(r"SUMMARY:\s*(.*?)$", raw, re.DOTALL)
-
-    if pos_match:
-        position = pos_match.group(1).strip()
-    else:
-        position = raw.strip()
-
-    if sum_match:
-        summary = sum_match.group(1).strip()
+    # Extract outlook as summary if present
+    outlook_match = re.search(r"## Outlook\s*(.*?)$", raw, re.DOTALL)
+    if outlook_match:
+        summary = outlook_match.group(1).strip()[:300]
 
     return position, summary
 
