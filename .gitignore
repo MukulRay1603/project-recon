@@ -34,3 +34,5 @@ eval/survey_sources_summary.txt
 *.log
 .pytest_cache/
 .mypy_cache/
+docs/*.png
+docs/*.json
