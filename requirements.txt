@@ -1,19 +1,24 @@
+# Core orchestration
 langgraph>=0.2.0
 langchain>=0.3.0
 langchain-groq
 langchain-huggingface
-sentence-transformers
-semanticscholar
+
+# Retrieval
 ddgs
 tavily-python
+sentence-transformers
+
+# Eval
 ragas
 datasets
+
+# UI
 gradio>=4.0.0
+
+# Utilities
 python-dotenv
 pandas
 tqdm
 networkx
 matplotlib
-fastapi
-uvicorn
-

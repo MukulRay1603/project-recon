@@ -37,7 +37,130 @@ def init_db() -> None:
                 FOREIGN KEY (session_id) REFERENCES sessions(session_id)
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS verdict_log (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at      TEXT NOT NULL,
+                query           TEXT NOT NULL,
+                verdict         TEXT NOT NULL,  -- PASS/STALE/CONTRADICTED/INSUFFICIENT/FORCED_PASS
+                mean_age_months REAL,           -- mean age of retrieved papers in months
+                retry_count     INTEGER,
+                papers_json     TEXT NOT NULL,  -- JSON list of {title, year, citation_count, paper_id}
+                critic_notes    TEXT,
+                session_id      TEXT
+            )
+        """)
         conn.commit()
+
+
+def log_verdict(
+    query: str,
+    verdict: str,
+    papers: list,
+    critic_notes: str = "",
+    mean_age_months: float = 0.0,
+    retry_count: int = 0,
+    session_id: str = "",
+) -> None:
+    """
+    Log every critic verdict to verdict_log for leaderboard generation.
+
+    Called from synthesizer_node after every completed pipeline run.
+    Each row represents one query where the critic fired a specific verdict,
+    along with the papers that were retrieved and evaluated.
+
+    This is the raw data that generates the real, query-driven superseded
+    paper leaderboard — not a pre-written document.
+
+    Args:
+        query:           The original research question
+        verdict:         PASS / STALE / CONTRADICTED / INSUFFICIENT / FORCED_PASS
+        papers:          List of Paper dataclass objects retrieved for this query
+        critic_notes:    Human-readable explanation from the critic
+        mean_age_months: Mean age of retrieved papers in months
+        retry_count:     Number of retries before this verdict
+        session_id:      Session UUID (optional, for traceability)
+    """
+    now = datetime.utcnow().isoformat()
+
+    # Serialise paper metadata — just what's needed for the leaderboard
+    papers_data = []
+    for p in papers[:8]:  # cap at 8 — same as synthesizer display limit
+        try:
+            papers_data.append({
+                "title":          getattr(p, "title", "") or "",
+                "year":           getattr(p, "year", 0) or 0,
+                "citation_count": getattr(p, "citation_count", 0) or 0,
+                "paper_id":       getattr(p, "paper_id", "") or "",
+                "authors":        (getattr(p, "authors", []) or [])[:2],
+                "hybrid_score":   round(getattr(p, "hybrid_score", 0.0) or 0.0, 4),
+            })
+        except Exception:
+            continue
+
+    try:
+        with _get_conn() as conn:
+            conn.execute(
+                """
+                INSERT INTO verdict_log
+                    (created_at, query, verdict, mean_age_months,
+                     retry_count, papers_json, critic_notes, session_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    now,
+                    query,
+                    verdict,
+                    round(mean_age_months, 1),
+                    retry_count,
+                    json.dumps(papers_data),
+                    critic_notes or "",
+                    session_id or "",
+                ),
+            )
+            conn.commit()
+    except Exception as e:
+        # Non-fatal — never let logging break the pipeline
+        import logging
+        logging.getLogger(__name__).warning(f"verdict_log insert failed: {e}")
+
+
+def query_verdict_log(
+    verdict_filter: list[str] | None = None,
+    min_count: int = 1,
+    limit: int = 500,
+) -> list[dict]:
+    """
+    Query the verdict log for leaderboard generation.
+
+    Args:
+        verdict_filter: List of verdicts to include, e.g. ['STALE', 'CONTRADICTED'].
+                        None = all verdicts.
+        min_count:      Minimum number of times a paper must appear to be included.
+        limit:          Max rows to return from the log.
+
+    Returns:
+        List of raw verdict_log rows as dicts.
+    """
+    with _get_conn() as conn:
+        if verdict_filter:
+            placeholders = ",".join("?" * len(verdict_filter))
+            rows = conn.execute(
+                f"""
+                SELECT * FROM verdict_log
+                WHERE verdict IN ({placeholders})
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (*verdict_filter, limit),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM verdict_log ORDER BY created_at DESC LIMIT ?",
+                (limit,),
+            ).fetchall()
+
+    return [dict(r) for r in rows]
 
 
 def load_session(session_id: str) -> SessionContext:

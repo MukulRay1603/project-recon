@@ -1,15 +1,18 @@
 import logging
 import json
 import re
+from datetime import datetime
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from src.state import ResearchState, Paper, Claim, SessionUpdate, WebResult
-from src.memory import save_turn
+from src.memory import save_turn, log_verdict
 
 load_dotenv()
 logger = logging.getLogger(__name__)
+
+CURRENT_YEAR = datetime.now().year
 
 _llm: ChatGroq | None = None
 
@@ -110,7 +113,6 @@ def _parse_position(raw: str) -> tuple[str, str]:
     position = raw.strip()
     summary = ""
 
-    # Extract outlook as summary if present
     outlook_match = re.search(r"## Outlook\s*(.*?)$", raw, re.DOTALL)
     if outlook_match:
         summary = outlook_match.group(1).strip()[:300]
@@ -165,6 +167,16 @@ Extract 4-6 key claims as a JSON array."""
     return []
 
 
+def _mean_age_months(papers: list[Paper]) -> float:
+    """Compute mean age of retrieved papers in months."""
+    ages = [
+        (CURRENT_YEAR - p.year) * 12
+        for p in papers
+        if p.year and p.year > 0
+    ]
+    return round(sum(ages) / len(ages), 1) if ages else 0.0
+
+
 # ---------------------------------------------------------------------------
 # Synthesizer node
 # ---------------------------------------------------------------------------
@@ -176,12 +188,14 @@ def synthesizer_node(state: ResearchState) -> ResearchState:
     Writes: synthesized_position, claim_confidences,
             session_update, export_md
     """
-    papers = state.get("retrieved_papers") or []
-    web_results = state.get("web_results") or []
-    query = state.get("original_query", "")
+    papers        = state.get("retrieved_papers") or []
+    web_results   = state.get("web_results") or []
+    query         = state.get("original_query", "")
     critic_verdict = state.get("critic_verdict", "")
-    session_id = state.get("session_id", "")
-    session_ctx = state.get("session_context")
+    critic_notes  = state.get("critic_notes", "")
+    session_id    = state.get("session_id", "")
+    session_ctx   = state.get("session_context")
+    retry_count   = state.get("retry_count", 0)
 
     is_contradicted = critic_verdict == "CONTRADICTED"
 
@@ -233,8 +247,8 @@ Synthesize a research position on this query using the evidence above."""
 
     # Build session update
     contradictions_found = []
-    if is_contradicted and state.get("critic_notes"):
-        contradictions_found = [state["critic_notes"]]
+    if is_contradicted and critic_notes:
+        contradictions_found = [critic_notes]
 
     session_update = SessionUpdate(
         query=query,
@@ -243,13 +257,32 @@ Synthesize a research position on this query using the evidence above."""
         contradictions_found=contradictions_found,
     )
 
-    # Persist to SQLite
+    # Persist turn to SQLite
     if session_id:
         try:
             save_turn(session_id, session_update)
             logger.info(f"Synthesizer: session turn saved for {session_id}")
         except Exception as e:
             logger.warning(f"Session save failed: {e}")
+
+    # ── Log verdict for leaderboard generation ────────────────────────────────
+    # Every completed pipeline run is logged — verdict, papers, query, age.
+    # This table accumulates real usage data that generates the superseded
+    # paper leaderboard from actual queries, not pre-written content.
+    try:
+        log_verdict(
+            query=query,
+            verdict=critic_verdict or "PASS",
+            papers=papers,
+            critic_notes=critic_notes,
+            mean_age_months=_mean_age_months(papers),
+            retry_count=retry_count,
+            session_id=session_id,
+        )
+        logger.info(f"Synthesizer: verdict logged ({critic_verdict})")
+    except Exception as e:
+        logger.warning(f"Verdict log failed (non-fatal): {e}")
+    # ── End verdict logging ───────────────────────────────────────────────────
 
     # Build markdown export
     export_md = _build_export_md(query, position, summary, claims, state)
