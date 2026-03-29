@@ -240,7 +240,7 @@ CSS = """
 footer { display: none !important; }
 """
 
-with gr.Blocks(title="RECON", css=CSS) as demo:
+with gr.Blocks(title="RECON") as demo:
 
     gr.HTML("""
 <div style="padding:20px 0 10px;border-bottom:1px solid #2d3748;margin-bottom:20px">
