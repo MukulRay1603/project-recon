@@ -358,4 +358,4 @@ with gr.Blocks(title="RECON") as demo:
     )
 
 if __name__ == "__main__":
-    demo.launch()
+    demo.launch(ssr_mode=False)
