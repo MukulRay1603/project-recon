@@ -14,7 +14,7 @@ ragas
 datasets
 
 # UI
-gradio>=4.0.0
+gradio==6.10.0
 
 # Utilities
 python-dotenv
