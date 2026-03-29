@@ -2,23 +2,16 @@
 langgraph>=0.2.0
 langchain>=0.3.0
 langchain-groq
-langchain-huggingface
 
 # Retrieval
 ddgs
 tavily-python
 sentence-transformers
-
-# Eval
-ragas
-datasets
+scikit-learn
 
 # UI
 gradio==6.10.0
 
 # Utilities
 python-dotenv
-pandas
-tqdm
-networkx
-matplotlib
+numpy
