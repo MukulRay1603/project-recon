@@ -33,7 +33,10 @@ def get_embedder() -> SentenceTransformer:
 # ---------------------------------------------------------------------------
 # Disk cache — prevents re-fetching on eval loop crashes
 # ---------------------------------------------------------------------------
-_CACHE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "cache")
+_CACHE_DIR = os.environ.get(
+    "RECON_CACHE_DIR",
+    os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "cache")
+)
 os.makedirs(_CACHE_DIR, exist_ok=True)
 
 def _cache_key(text: str) -> str:
