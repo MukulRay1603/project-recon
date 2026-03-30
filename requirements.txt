@@ -9,9 +9,6 @@ tavily-python
 sentence-transformers
 scikit-learn
 
-# UI
-gradio==6.10.0
-
 # Utilities
 python-dotenv
 numpy
