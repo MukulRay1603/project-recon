@@ -25,7 +25,8 @@ data/cache/
 *.db
 
 # RECON — eval outputs (large, reproducible)
-eval/results/
+eval/results/*
+!eval/results/summary.csv
 eval/survey_sources.json
 eval/survey_sources_summary.txt
 

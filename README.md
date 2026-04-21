@@ -43,7 +43,9 @@ session_loader → planner → retriever → critic → synthesizer
 - `CONTRADICTED` — claims conflict across retrieved sources
 - `INSUFFICIENT` — not enough high-quality evidence to synthesize
 
-If the critic flags anything other than PASS, the retriever tries again with a refined query (max 2 retries). This retry loop is what drives the staleness catch rate improvement.
+The critic combines deterministic threshold routing with an LLM-assisted contradiction check. STALE, INSUFFICIENT, and PASS verdicts are assigned based on hardcoded thresholds (mean paper age, minimum result count, score cutoffs). CONTRADICTED is determined by calling Groq with a structured pairwise prompt that returns a `{"contradicts": bool, "reason": "..."}` JSON verdict — a canonical LLM-as-a-Judge pattern applied to contradiction detection specifically.
+
+If the critic issues anything other than PASS, the retriever tries again with a refined query (max 2 retries). This retry loop is what drives the staleness catch rate improvement.
 
 **Synthesizer** — produces a structured research position: overview, key findings, active debates, and a per-claim confidence table with source attribution.
 
@@ -102,7 +104,7 @@ This is a **reference dataset used in evaluation** — not auto-generated from l
 | Fallback retrieval | DuckDuckGo (`ddgs`) + Tavily |
 | Embeddings | `all-MiniLM-L6-v2` |
 | Session memory | SQLite |
-| Eval | LLM-as-judge + custom staleness catch rate metric |
+| Eval | LLM-assisted contradiction detection (Groq structured prompt) + custom staleness catch rate metric |
 | UI | Gradio 6.10 |
 
 One deliberate choice worth noting: the `semanticscholar` PyPI library was explicitly avoided due to a pagination hang bug on large result sets. All S2 calls go through direct `requests.get()` to `graph/v1/paper/search`.

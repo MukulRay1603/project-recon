@@ -1,0 +1,6 @@
+architecture,total_questions,position_match_rate,staleness_catch_rate,contradiction_catch_rate,avg_latency_ms,retry_rate,error_rate
+single_rag,130,0.3231,0.0,0.3,4786.3,0.0,0.0
+naive_multi,130,0.4462,0.0,1.0,23866.0,0.0,0.0
+recon_none,130,0.4769,0.42,1.0,21817.6,0.3923,0.0
+recon_linear,130,0.4385,0.52,1.0,17094.4,0.3385,0.0
+recon_log,130,0.4308,0.38,1.0,15943.1,0.3615,0.0
