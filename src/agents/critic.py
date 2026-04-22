@@ -7,6 +7,7 @@ from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from src.state import ResearchState, Paper, Verdict
+from src.reliability import score_papers, ReliabilityScore
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -189,9 +190,19 @@ def critic_node(state: ResearchState) -> ResearchState:
             "calibration_bin": Verdict.INSUFFICIENT,
         }
 
+    # --- Phase 2.4: Compute edge reliability scores for all papers ---
+    original_query = state.get("original_query", "")
+    reliability_scores = score_papers(papers, query=original_query, use_llm=True)
+
     # --- Run STALE and CONTRADICTED checks in parallel (both always run) ---
     mean_age = _mean_age_months(papers)
-    is_stale = mean_age > 24
+    # v2: STALE = low reliability across retrieved papers (not just mean age)
+    if reliability_scores:
+        mean_reliability = sum(rs.score for rs in reliability_scores.values()) / len(reliability_scores)
+        is_stale = mean_reliability < 0.40
+    else:
+        # fallback to v1 age threshold if scorer failed
+        is_stale = mean_age > 24
 
     contradictions = _detect_contradictions(papers)
     is_contradicted = len(contradictions) > 0
@@ -219,6 +230,7 @@ def critic_node(state: ResearchState) -> ResearchState:
             "retry_count": retry_count,
             "rewritten_questions": [],
             "calibration_bin": Verdict.PASS,
+            "paper_reliability_scores": {pid: rs.__dict__ for pid, rs in reliability_scores.items()},
         }
 
     # --- Non-PASS path: rewrite questions and return ---
@@ -230,4 +242,5 @@ def critic_node(state: ResearchState) -> ResearchState:
         "rewritten_questions": rewritten,
         "retry_count": retry_count + 1,
         "calibration_bin": verdict,
+        "paper_reliability_scores": {pid: rs.__dict__ for pid, rs in reliability_scores.items()},
     }

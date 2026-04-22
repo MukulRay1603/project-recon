@@ -100,3 +100,4 @@ class ResearchState(TypedDict):
     decay_config: str                     # "none" | "linear" | "log"
     calibration_bin: str                  # filled by critic for eval aggregation
     latency_ms: float
+    paper_reliability_scores: dict        # {paper_id: ReliabilityScore.__dict__}
