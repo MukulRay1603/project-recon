@@ -199,7 +199,7 @@ def critic_node(state: ResearchState) -> ResearchState:
     # v2: STALE = low reliability across retrieved papers (not just mean age)
     if reliability_scores:
         mean_reliability = sum(rs.score for rs in reliability_scores.values()) / len(reliability_scores)
-        is_stale = mean_reliability < 0.40
+        is_stale = mean_reliability < 0.50
     else:
         # fallback to v1 age threshold if scorer failed
         is_stale = mean_age > 24
