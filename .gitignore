@@ -32,11 +32,26 @@ eval/survey_sources_summary.txt
 
 # Misc
 .DS_Store
+Thumbs.db
 *.log
+.ipynb_checkpoints/
 .pytest_cache/
 .mypy_cache/
 docs/*.png
 docs/*.json
 
-docs/*.png
-docs/*.json
+# Claude Code
+.claude/
+
+# Secrets
+*.pem
+*.key
+credentials*.json
+service-account*.json
+
+# Session artifacts
+CHANGES_APPLIED.md
+CLEANUP_DONE_*.md
+*_VERIFICATION.md
+*_RECON.md
+ROTATION_CHECKLIST.md
