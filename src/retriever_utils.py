@@ -129,7 +129,7 @@ def search_semantic_scholar(
     params = {
         "query": query,
         "limit": limit,
-        "fields": "title,abstract,year,citationCount,authors,references,paperId",
+        "fields": "title,abstract,year,citationCount,authors,references,paperId,externalIds",
     }
 
     time.sleep(3)  # rate limit guard
@@ -170,6 +170,7 @@ def search_semantic_scholar(
             if ref.get("paperId")
         ]
 
+        doi = (r.get("externalIds") or {}).get("DOI", "") or ""
         paper = Paper(
             title=r.get("title") or "Untitled",
             abstract=abstract,
@@ -178,6 +179,7 @@ def search_semantic_scholar(
             paper_id=r.get("paperId") or "",
             authors=authors,
             references=references,
+            doi=doi,
             hybrid_score=hybrid_score(sim, year, citations, decay_config),
             source="semantic_scholar",
         )

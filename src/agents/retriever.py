@@ -7,6 +7,7 @@ from src.retriever_utils import (
     search_semantic_scholar,
     search_web,
     build_citation_graph,
+    hybrid_score,
 )
 
 load_dotenv()
@@ -94,6 +95,51 @@ def retriever_node(state: ResearchState) -> ResearchState:
         # Small pause between sub-questions to be gentle on APIs
         if i < len(sub_questions) - 1:
             time.sleep(1)
+
+    # --- Phase 2.2: OpenAlex augmentation ---
+    from src.openalex_utils import search_openalex
+    existing_dois = {p.doi.lower() for p in all_papers if p.doi}
+    existing_ids = {p.paper_id for p in all_papers}
+
+    if len(all_papers) < 12:
+        for question in sub_questions[:2]:  # only first 2 sub-questions
+            try:
+                oa_results = search_openalex(question, max_results=3)
+                for r in oa_results:
+                    doi_lower = (r.get("doi") or "").lower()
+                    pid = r.get("paper_id") or ""
+                    # Skip if we already have this paper by DOI or paper_id
+                    if doi_lower and doi_lower in existing_dois:
+                        continue
+                    if pid in existing_ids:
+                        continue
+                    # Build Paper object from OpenAlex result
+                    p = Paper(
+                        title=r.get("title") or "",
+                        abstract=r.get("abstract") or "",
+                        year=r.get("year") or 0,
+                        citation_count=r.get("citation_count") or 0,
+                        paper_id=pid,
+                        authors=[a.strip() for a in (r.get("authors") or "").split(",") if a.strip()],
+                        references=[],
+                        doi=r.get("doi") or "",
+                        source="openalex",
+                    )
+                    if not p.title or not p.year:
+                        continue
+                    p.hybrid_score = hybrid_score(
+                        semantic_sim=0.3,  # conservative default — no query embedding for OA papers
+                        year=p.year,
+                        citation_count=p.citation_count,
+                        decay_config=decay_config,
+                    )
+                    all_papers.append(p)
+                    existing_dois.add(doi_lower)
+                    existing_ids.add(pid)
+                time.sleep(0.5)  # be polite to OpenAlex
+            except Exception as e:
+                logger.warning(f"OpenAlex augmentation failed for '{question[:40]}': {e}")
+                continue
 
     # Sort papers by hybrid score descending
     all_papers.sort(key=lambda p: p.hybrid_score, reverse=True)

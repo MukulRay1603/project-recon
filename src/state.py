@@ -15,6 +15,7 @@ class Paper:
     paper_id: str
     authors: list[str] = field(default_factory=list)
     references: list[str] = field(default_factory=list)  # list of paper_ids
+    doi: str = ""
     hybrid_score: float = 0.0
     source: str = "semantic_scholar"  # or "web"
 
