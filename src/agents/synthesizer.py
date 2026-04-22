@@ -284,6 +284,41 @@ Synthesize a research position on this query using the evidence above."""
         logger.warning(f"Verdict log failed (non-fatal): {e}")
     # ── End verdict logging ───────────────────────────────────────────────────
 
+    # --- Phase 2.6: Trust summary block ---
+    reliability_scores = state.get("paper_reliability_scores", {})
+    if reliability_scores and papers:
+        trust_lines = ["\n\n---\n## Evidence Trust Summary\n"]
+        for p in papers[:8]:  # same top-8 window synthesizer already uses
+            rs = reliability_scores.get(p.paper_id)
+            if not rs:
+                continue
+            # Format author citation
+            if p.authors and len(p.authors) > 0:
+                first_author = p.authors[0] if isinstance(p.authors, list) else str(p.authors).split(",")[0]
+                last_name = first_author.strip().split()[-1] if first_author.strip() else "Unknown"
+                citation_label = f"{last_name} et al., {p.year}"
+            else:
+                citation_label = f"Paper {p.year}"
+
+            # Signal label to human-readable
+            signal_map = {
+                "FOUNDATIONAL": "HIGH — foundational work",
+                "CURRENT": "HIGH — current",
+                "DECLINING": "MEDIUM — declining relevance",
+                "SUPERSEDED": "LOW — likely superseded",
+            }
+            dominant = rs.get("dominant_signal", "DECLINING") if isinstance(rs, dict) else rs.dominant_signal
+            score_val = rs.get("score", 0.0) if isinstance(rs, dict) else rs.score
+            reason_val = rs.get("reason", "") if isinstance(rs, dict) else rs.reason
+            reliability_label = signal_map.get(dominant, f"score={score_val:.2f}")
+
+            trust_lines.append(
+                f"**[{citation_label}]**  \n"
+                f"Reliability: {reliability_label}  \n"
+                f"Reason: {reason_val}\n"
+            )
+        position = position + "".join(trust_lines)
+
     # Build markdown export
     export_md = _build_export_md(query, position, summary, claims, state)
 
