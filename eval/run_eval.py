@@ -130,10 +130,10 @@ def _groq_call_with_backoff(llm: ChatGroq, messages: list) -> str:
             if retry_after > _MAX_WAIT_SECONDS:
                 # Daily token limit — no point waiting
                 print(
-                    f"\n⛔ Groq daily token limit reached "
+                    f"\n[STOP] Groq daily token limit reached "
                     f"(retry-after={retry_after:.0f}s > {_MAX_WAIT_SECONDS}s cap).\n"
                     f"   Results saved so far are intact.\n"
-                    f"   Re-run tomorrow — the harness will resume from where it stopped.\n"
+                    f"   Re-run tomorrow -- the harness will resume from where it stopped.\n"
                     f"   Exiting cleanly now."
                 )
                 raise SystemExit(0)
@@ -141,7 +141,7 @@ def _groq_call_with_backoff(llm: ChatGroq, messages: list) -> str:
             # TPM limit — wait and retry
             actual_wait = min(retry_after + 2, _MAX_WAIT_SECONDS)
             print(
-                f"\n⏳ Groq rate limit (attempt {attempt+1}/{_MAX_RETRIES}). "
+                f"\n[WAIT] Groq rate limit (attempt {attempt+1}/{_MAX_RETRIES}). "
                 f"Waiting {actual_wait:.0f}s before retry..."
             )
             time.sleep(actual_wait)
@@ -445,7 +445,7 @@ def run_architecture(
     print(f"{'='*60}")
 
     if not remaining:
-        print("  ✓ Already complete, skipping.")
+        print("  [done] Already complete, skipping.")
         return
 
     f, writer = get_csv_writer(output_path)
@@ -520,9 +520,9 @@ def run_architecture(
                     raise
                 row["position_accuracy"] = score
                 row["judge_reason"]      = reason[:200]
-                print(f"    → verdict={row['critic_verdict']}  judge={score}  {reason[:60]}")
+                print(f"    >> verdict={row['critic_verdict']}  judge={score}  {reason[:60]}")
             else:
-                print(f"    → verdict={row['critic_verdict']}  judge=SKIPPED (no position or GT)")
+                print(f"    >> verdict={row['critic_verdict']}  judge=SKIPPED (no position or GT)")
 
             # ── Staleness catch rate — Category B ────────────────────────
             if category == "B":
@@ -538,7 +538,7 @@ def run_architecture(
     finally:
         f.close()
 
-    print(f"\n  ✓ {arch_name} complete → {output_path}")
+    print(f"\n  [done] {arch_name} complete -> {output_path}")
 
 
 # ── Summary aggregation ───────────────────────────────────────────────────────
@@ -622,7 +622,7 @@ def compute_summary(results_dir: str) -> None:
             writer = csv.DictWriter(f, fieldnames=list(summary_rows[0].keys()))
             writer.writeheader()
             writer.writerows(summary_rows)
-        print(f"\n✅ Summary written → {summary_path}")
+        print(f"\n[OK] Summary written -> {summary_path}")
         print_summary_table(summary_rows)
     else:
         print("\n⚠ No completed result files found to summarise.")
@@ -643,8 +643,8 @@ def print_summary_table(rows: list[dict]) -> None:
             f"  {r['retry_rate']*100:>6.1f}%"
         )
     print("="*90)
-    print("→ staleness_catch_rate and contradiction_catch_rate are your headline resume metrics.")
-    print("→ Copy these numbers into resume bullets after verifying they make sense.")
+    print(">> staleness_catch_rate and contradiction_catch_rate are your headline resume metrics.")
+    print(">> Copy these numbers into resume bullets after verifying they make sense.")
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
@@ -725,7 +725,7 @@ def main():
     # ── Compute and print summary ─────────────────────────────────────────────
     compute_summary(RESULTS_DIR)
 
-    print("\n✅ Evaluation complete.")
+    print("\n[OK] Evaluation complete.")
     print("Next steps:")
     print("  1. Review eval/results/summary.csv for headline metrics")
     print("  2. Run eval/calibration.py to generate calibration curve PNG")
