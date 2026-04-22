@@ -43,7 +43,14 @@ def _highlight_citations(text: str) -> str:
         text
     )
 
-def _paper_cards_html(papers) -> str:
+SIGNAL_COLORS = {
+    "FOUNDATIONAL": "#22c55e",
+    "CURRENT":      "#3b82f6",
+    "DECLINING":    "#f59e0b",
+    "SUPERSEDED":   "#ef4444",
+}
+
+def _paper_cards_html(papers, reliability_scores: dict = {}) -> str:
     """Render retrieved papers as styled cards."""
     if not papers:
         return "<p style='color:#6b7280;font-style:italic'>No papers retrieved.</p>"
@@ -54,15 +61,29 @@ def _paper_cards_html(papers) -> str:
         authors = ", ".join(p.authors[:2]) + (" et al." if len(p.authors) > 2 else "") if p.authors else "Unknown"
         abstract_preview = (p.abstract[:180] + "...") if p.abstract and len(p.abstract) > 180 else (p.abstract or "")
 
+        rs = reliability_scores.get(p.paper_id)
+        if rs:
+            dominant = rs.get("dominant_signal", "DECLINING") if isinstance(rs, dict) else rs.dominant_signal
+            sig_color = SIGNAL_COLORS.get(dominant, "#6b7280")
+            signal_badge = (
+                f'<span style="background:{sig_color}22;color:{sig_color};border:1px solid {sig_color}44;'
+                f'padding:2px 7px;border-radius:12px;font-size:0.75em;white-space:nowrap;font-weight:600;margin-left:6px">'
+                f'{dominant}</span>'
+            )
+        else:
+            signal_badge = ""
+
         cards.append(f"""
 <div style="border:1px solid #2d3748;border-radius:8px;padding:12px 14px;
             margin-bottom:8px;background:#1a1f2e;">
   <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px">
     <span style="font-weight:600;font-size:0.92em;color:#e2e8f0;flex:1;margin-right:8px">{p.title}</span>
-    <span style="background:{score_color}22;color:{score_color};border:1px solid {score_color}44;
-                 padding:2px 8px;border-radius:12px;font-size:0.78em;white-space:nowrap;font-weight:600">
-      {p.hybrid_score:.3f}
-    </span>
+    <div style="display:flex;align-items:center;flex-shrink:0">
+      <span style="background:{score_color}22;color:{score_color};border:1px solid {score_color}44;
+                   padding:2px 8px;border-radius:12px;font-size:0.78em;white-space:nowrap;font-weight:600">
+        {p.hybrid_score:.3f}
+      </span>{signal_badge}
+    </div>
   </div>
   <div style="color:#94a3b8;font-size:0.8em;margin-bottom:6px">
     {authors} · {p.year} · {p.citation_count:,} citations · <span style="color:#64748b">{p.source}</span>
@@ -205,7 +226,7 @@ def run_query(query, session_id, decay_config, history):
     verdict_html  = _verdict_badge_html(verdict, critic_notes, retry_count,
                                          papers_used, latency, decay_config, rewritten)
     claims_html   = _claims_html(result.get("claim_confidences") or [])
-    papers_html   = _paper_cards_html(result.get("retrieved_papers") or [])
+    papers_html   = _paper_cards_html(result.get("retrieved_papers") or [], result.get("paper_reliability_scores") or {})
     session_ctx   = load_session(session_id)
     session_html  = _session_html(session_ctx, session_id)
     export_md     = result.get("export_md", "")
