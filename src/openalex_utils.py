@@ -34,7 +34,7 @@ def _headers() -> dict:
     key = _get_api_key()
     if key:
         return {"Authorization": f"Bearer {key}"}
-    logger.warning("OPENALEX_API_KEY not set — requests may be rate limited")
+    logger.debug("OPENALEX_API_KEY not set — requests may be rate limited")
     return {}
 
 
