@@ -155,11 +155,22 @@ Return ONLY the JSON array."""
     return [_compute_recency(p.year) for p in papers]
 
 
-def _dominant_signal(score: float, centrality: float, recency: float) -> str:
-    """Classify dominant signal for explainability."""
-    if score >= THRESHOLD_FOUNDATIONAL_RELIABILITY and centrality >= THRESHOLD_FOUNDATIONAL_CENTRALITY:
+def _dominant_signal(score: float, centrality: float, recency: float, coherence: float) -> str:
+    """
+    Classify dominant signal for explainability.
+
+    FOUNDATIONAL: high centrality + high coherence — trusted regardless of age
+    CURRENT: recent + reliable — recently published and well-supported
+    DECLINING: mixed signals — some reliability but losing relevance
+    SUPERSEDED: low reliability overall — likely outdated
+    """
+    # Foundational: highly cited AND content is still coherent with consensus
+    # Age is irrelevant for foundational papers — that's the point.
+    # When coherence=0.0 (LLM off, recency proxy for old paper), centrality alone qualifies.
+    if centrality >= THRESHOLD_FOUNDATIONAL_CENTRALITY and (coherence >= 0.65 or coherence == 0.0):
         return "FOUNDATIONAL"
-    elif score >= THRESHOLD_CURRENT_RELIABILITY and recency >= THRESHOLD_CURRENT_RECENCY:
+    # Current: recent paper with good reliability
+    elif recency >= THRESHOLD_CURRENT_RECENCY and score >= THRESHOLD_CURRENT_RELIABILITY:
         return "CURRENT"
     elif score >= THRESHOLD_DECLINING_LOW:
         return "DECLINING"
@@ -225,7 +236,7 @@ def score_papers(papers: list, query: str, use_llm: bool = True) -> dict[str, Re
         co = coherences[i] if i < len(coherences) else r
 
         score = W_CENTRALITY * c + W_RECENCY * r + W_COHERENCE * co
-        dominant = _dominant_signal(score, c, r)
+        dominant = _dominant_signal(score, c, r, co)
         reason = _build_reason(dominant, c, r, co, getattr(p, "year", None))
 
         results[p.paper_id] = ReliabilityScore(
