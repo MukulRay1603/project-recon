@@ -157,10 +157,10 @@ def critic_node(state: ResearchState) -> ResearchState:
     if retry_count >= 2:
         logger.info("Critic: max retries reached, forcing PASS")
         return {
-            **state,
             "critic_verdict": Verdict.FORCED_PASS,
             "critic_notes": "Max retries reached. Passing with available evidence.",
             "rewritten_questions": [],
+            "retry_count": retry_count,
             "calibration_bin": Verdict.FORCED_PASS,
         }
 
@@ -169,7 +169,6 @@ def critic_node(state: ResearchState) -> ResearchState:
         logger.info(f"Critic: insufficient papers ({len(papers)})")
         rewritten = _rewrite_questions(state.get("sub_questions") or [], "broaden")
         return {
-            **state,
             "critic_verdict": Verdict.INSUFFICIENT,
             "critic_notes": f"Only {len(papers)} papers retrieved. Need at least 3.",
             "rewritten_questions": rewritten,
@@ -183,7 +182,6 @@ def critic_node(state: ResearchState) -> ResearchState:
         logger.info("Critic: insufficient high-score papers")
         rewritten = _rewrite_questions(state.get("sub_questions") or [], "broaden")
         return {
-            **state,
             "critic_verdict": Verdict.INSUFFICIENT,
             "critic_notes": "Fewer than 3 papers with hybrid_score >= 0.40.",
             "rewritten_questions": rewritten,
@@ -191,41 +189,45 @@ def critic_node(state: ResearchState) -> ResearchState:
             "calibration_bin": Verdict.INSUFFICIENT,
         }
 
-    # STALE — evidence too old
+    # --- Run STALE and CONTRADICTED checks in parallel (both always run) ---
     mean_age = _mean_age_months(papers)
-    if mean_age > 24:
-        logger.info(f"Critic: evidence is stale (mean age: {mean_age:.1f} months)")
-        rewritten = _rewrite_questions(state.get("sub_questions") or [], "recent")
-        return {
-            **state,
-            "critic_verdict": Verdict.STALE,
-            "critic_notes": f"Mean paper age is {mean_age:.0f} months. Evidence may be outdated.",
-            "rewritten_questions": rewritten,
-            "retry_count": retry_count + 1,
-            "calibration_bin": Verdict.STALE,
-        }
+    is_stale = mean_age > 24
 
-    # CONTRADICTED — papers disagree
     contradictions = _detect_contradictions(papers)
-    if contradictions:
-        pa_title, pb_title, reason = contradictions[0]
-        logger.info("Critic: contradiction detected")
-        rewritten = _rewrite_questions(state.get("sub_questions") or [], "probe_contradiction")
+    is_contradicted = len(contradictions) > 0
+
+    # --- Combine signals: CONTRADICTED wins when both fire ---
+    if is_contradicted and is_stale:
+        verdict = Verdict.CONTRADICTED
+        contradiction_details = "; ".join(f"'{c[0]}' vs '{c[1]}': {c[2]}" for c in contradictions)
+        notes = f"CONTRADICTED (also stale, mean age {mean_age:.0f} months). Contradictions found: {contradiction_details}"
+        strategy = "probe_contradiction"
+    elif is_contradicted:
+        verdict = Verdict.CONTRADICTED
+        contradiction_details = "; ".join(f"'{c[0]}' vs '{c[1]}': {c[2]}" for c in contradictions)
+        notes = f"Contradictions found: {contradiction_details}"
+        strategy = "probe_contradiction"
+    elif is_stale:
+        verdict = Verdict.STALE
+        notes = f"Evidence is stale (mean age {mean_age:.0f} months > 24 month threshold)"
+        strategy = "recent"
+    else:
+        # PASS — all checks clear
         return {
-            **state,
-            "critic_verdict": Verdict.CONTRADICTED,
-            "critic_notes": f"Contradiction: '{pa_title[:50]}' vs '{pb_title[:50]}'. {reason}",
-            "rewritten_questions": rewritten,
-            "retry_count": retry_count + 1,
-            "calibration_bin": Verdict.CONTRADICTED,
+            "critic_verdict": Verdict.PASS,
+            "critic_notes": f"Evidence passes all checks (mean age {mean_age:.0f} months, {len(papers)} papers, no contradictions detected)",
+            "retry_count": retry_count,
+            "rewritten_questions": [],
+            "calibration_bin": Verdict.PASS,
         }
 
-    # PASS
-    logger.info("Critic: evidence passes")
+    # --- Non-PASS path: rewrite questions and return ---
+    sub_questions = state.get("sub_questions") or []
+    rewritten = _rewrite_questions(sub_questions, strategy)
     return {
-        **state,
-        "critic_verdict": Verdict.PASS,
-        "critic_notes": f"Evidence is recent (mean age: {mean_age:.0f} months), sufficient ({len(papers)} papers), no contradictions detected.",
-        "rewritten_questions": [],
-        "calibration_bin": Verdict.PASS,
+        "critic_verdict": verdict,
+        "critic_notes": notes,
+        "rewritten_questions": rewritten,
+        "retry_count": retry_count + 1,
+        "calibration_bin": verdict,
     }
