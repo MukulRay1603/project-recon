@@ -185,13 +185,13 @@ def _build_reason(dominant: str, centrality: float, recency: float,
     age_str = f"{age}yr old" if age is not None else "unknown age"
 
     if dominant == "FOUNDATIONAL":
-        return f"High citation centrality ({centrality:.2f}), {age_str} — foundational work still current"
+        return f"High citation centrality ({centrality:.2f}), {age_str} - foundational work still current"
     elif dominant == "CURRENT":
-        return f"Recent ({age_str}), coherence={coherence:.2f} — aligns with current consensus"
+        return f"Recent ({age_str}), coherence={coherence:.2f} - aligns with current consensus"
     elif dominant == "DECLINING":
         return f"Mixed signals: centrality={centrality:.2f}, recency={recency:.2f}, coherence={coherence:.2f}"
     else:
-        return f"Low reliability: {age_str}, centrality={centrality:.2f}, coherence={coherence:.2f} — likely superseded"
+        return f"Low reliability: {age_str}, centrality={centrality:.2f}, coherence={coherence:.2f} - likely superseded"
 
 
 def score_papers(papers: list, query: str, use_llm: bool = True) -> dict[str, ReliabilityScore]:

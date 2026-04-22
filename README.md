@@ -11,6 +11,8 @@ license: mit
 short_description: Multi-agent ML literature research with staleness detection
 ---
 
+> For full documentation, architecture details, and eval results: [GITHUB_README.md](./GITHUB_README.md)
+
 # RECON — Temporally-Aware Scientific Retrieval
 
 A multi-agent RAG system that detects when retrieved scientific evidence has been superseded by newer work.

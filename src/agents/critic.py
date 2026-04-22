@@ -163,6 +163,7 @@ def critic_node(state: ResearchState) -> ResearchState:
             "rewritten_questions": [],
             "retry_count": retry_count,
             "calibration_bin": Verdict.FORCED_PASS,
+            "paper_reliability_scores": {},
         }
 
     # INSUFFICIENT — not enough papers
@@ -175,6 +176,7 @@ def critic_node(state: ResearchState) -> ResearchState:
             "rewritten_questions": rewritten,
             "retry_count": retry_count + 1,
             "calibration_bin": Verdict.INSUFFICIENT,
+            "paper_reliability_scores": {},
         }
 
     # INSUFFICIENT — scores too low
@@ -188,11 +190,18 @@ def critic_node(state: ResearchState) -> ResearchState:
             "rewritten_questions": rewritten,
             "retry_count": retry_count + 1,
             "calibration_bin": Verdict.INSUFFICIENT,
+            "paper_reliability_scores": {},
         }
 
     # --- Phase 2.4: Compute edge reliability scores for all papers ---
     original_query = state.get("original_query", "")
-    reliability_scores = score_papers(papers, query=original_query, use_llm=True)
+    try:
+        reliability_scores = score_papers(papers, query=original_query, use_llm=True)
+        if not reliability_scores:
+            logger.warning("score_papers() returned empty dict — falling back to no reliability scores")
+    except Exception as e:
+        logger.warning(f"score_papers() failed entirely: {e} — trust summary will be skipped")
+        reliability_scores = {}
 
     # --- Run STALE and CONTRADICTED checks in parallel (both always run) ---
     mean_age = _mean_age_months(papers)

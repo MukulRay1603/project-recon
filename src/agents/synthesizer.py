@@ -286,6 +286,8 @@ Synthesize a research position on this query using the evidence above."""
 
     # --- Phase 2.6: Trust summary block ---
     reliability_scores = state.get("paper_reliability_scores", {})
+    if not reliability_scores:
+        logger.warning("paper_reliability_scores is empty — trust summary skipped. Check if score_papers() ran in critic.")
     if reliability_scores and papers:
         trust_lines = ["\n\n---\n## Evidence Trust Summary\n"]
         for p in papers[:8]:  # same top-8 window synthesizer already uses
