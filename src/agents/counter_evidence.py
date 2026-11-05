@@ -50,7 +50,10 @@ CRITIQUE_TERMS = [
 ]
 
 COUNTER_LIMIT_PER_QUESTION = 3
-MAX_QUERIES = 4
+# Each query is one more S2 request through the shared rate limiter
+# (~1s with a key, 3s without), so keep this small. Override with
+# RECON_COUNTER_QUERIES.
+MAX_QUERIES = int(os.environ.get("RECON_COUNTER_QUERIES", "2"))
 
 
 def is_enabled() -> bool:

@@ -57,7 +57,7 @@ def test_node_excludes_supporting_papers_and_dedupes(monkeypatch):
     assert ids == ["opp-2", "opp-1"]           # sorted by score, deduped, supporting removed
     assert all(p.source.endswith("+counter") for p in out["opposing_papers"])
     assert out["retrieved_papers"] == state["retrieved_papers"]  # supporting set untouched
-    assert len(calls) == 3
+    assert len(calls) == ce.MAX_QUERIES
 
 
 def test_node_survives_search_errors(monkeypatch):

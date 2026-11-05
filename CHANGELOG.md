@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### v2.1 — Counter-evidence retrieval, parallel retrieval, reliability (branch `upgrade/recon-2026-11`)
+- New `counter_evidence` graph node (src/agents/counter_evidence.py): rule-based claim
+  negation + critique terms → up to 2 extra S2 queries; results in `opposing_papers`,
+  paired with top supporting papers in the critic's existing contradiction check.
+  Staleness scoring unchanged (uses `retrieved_papers` only). `RECON_COUNTER_EVIDENCE=0` disables.
+- Retriever fetches sub-questions in parallel (`RECON_RETRIEVAL_WORKERS`, default 3)
+  behind a process-wide S2 rate limiter that replaces the fixed `sleep(3)`.
+- S2 requests: timeout + exponential backoff on 429/5xx/network errors, honours Retry-After.
+- All Groq clients: explicit timeout (30s) and max_retries (2).
+- Unit tests in tests/ (no network/keys/torch) + GitHub Actions workflow.
+- Benchmark results in README unchanged — the 130-question eval has not been re-run.
+
 ### Phase 2 — Edge Reliability Scoring + OpenAlex Augmentation
 - 2.1: Created src/openalex_utils.py
   - `search_openalex(query, max_results=5)` — keyword search, returns Paper-compatible dicts
