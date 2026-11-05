@@ -1,15 +1,16 @@
 import logging
 import time
-from dotenv import load_dotenv
-from langgraph.graph import StateGraph, END
 
-from src.state import ResearchState, Verdict
-from src.memory import init_db, load_session
-from src.agents.planner import planner_node
-from src.agents.retriever import retriever_node
+from dotenv import load_dotenv
+from langgraph.graph import END, StateGraph
+
 from src.agents.counter_evidence import counter_evidence_node
 from src.agents.critic import critic_node
+from src.agents.planner import planner_node
+from src.agents.retriever import retriever_node
 from src.agents.synthesizer import synthesizer_node
+from src.memory import init_db, load_session
+from src.state import ResearchState, Verdict
 
 load_dotenv()
 logger = logging.getLogger(__name__)
@@ -181,20 +182,8 @@ def build_graph() -> StateGraph:
 # Public run function
 # ---------------------------------------------------------------------------
 
-def run_recon(
-    query: str,
-    session_id: str,
-    decay_config: str = "linear",
-) -> ResearchState:
-    """
-    Run the full RECON pipeline for a query.
-    Returns the final state.
-    """
-    init_db()
-
-    graph = build_graph()
-
-    initial_state: ResearchState = {
+def _initial_state(query: str, session_id: str, decay_config: str) -> ResearchState:
+    return {
         "original_query": query,
         "session_id": session_id,
         "session_context": None,
@@ -214,7 +203,43 @@ def run_recon(
         "decay_config": decay_config,
         "calibration_bin": "",
         "latency_ms": 0.0,
+        "paper_reliability_scores": {},
     }
+
+
+def stream_recon(query: str, session_id: str, decay_config: str = "linear"):
+    """
+    Same pipeline as run_recon, but yields (node_name, state_so_far) after
+    each node finishes, so a UI can show progress per agent. The last item
+    is ("__done__", final_state) with latency_ms filled in.
+    """
+    init_db()
+    graph = build_graph()
+    state = dict(_initial_state(query, session_id, decay_config))
+    start = time.time()
+    for update in graph.stream(state, stream_mode="updates"):
+        for node, delta in update.items():
+            if delta:
+                state.update(delta)
+            yield node, state
+    state["latency_ms"] = (time.time() - start) * 1000
+    yield "__done__", state
+
+
+def run_recon(
+    query: str,
+    session_id: str,
+    decay_config: str = "linear",
+) -> ResearchState:
+    """
+    Run the full RECON pipeline for a query.
+    Returns the final state.
+    """
+    init_db()
+
+    graph = build_graph()
+
+    initial_state = _initial_state(query, session_id, decay_config)
 
     start = time.time()
     logger.info(f"RECON run started: '{query[:60]}'")

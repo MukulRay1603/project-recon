@@ -16,6 +16,8 @@ jobs:
           cache: pip
           cache-dependency-path: requirements-dev.txt
       - run: pip install -r requirements-dev.txt
+      # Lint with ruff's default error rules on files touched since v2.1.
+      - run: ruff check --isolated --select E4,E7,E9,F app.py scripts tests src/graph.py src/agents/counter_evidence.py src/llm_config.py
       # Unit tests only: no network, no API keys. The scripts in Test_Files/
       # are manual integration checks that hit live APIs and are not run here.
       - run: python -m pytest -q tests

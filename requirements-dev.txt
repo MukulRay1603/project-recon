@@ -7,3 +7,5 @@ numpy
 langgraph>=0.2.0
 langchain-core
 langchain-groq
+gradio==6.10.0
+ruff
