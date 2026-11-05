@@ -1,0 +1,9 @@
+# Lightweight deps for unit tests / CI. Deliberately excludes
+# sentence-transformers (torch) — tests never load the embedding model.
+pytest
+requests
+python-dotenv
+numpy
+langgraph>=0.2.0
+langchain-core
+langchain-groq

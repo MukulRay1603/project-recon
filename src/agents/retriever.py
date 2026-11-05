@@ -1,5 +1,6 @@
 import logging
-import time
+import os
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 
 from src.state import ResearchState, Paper, WebResult
@@ -16,6 +17,10 @@ logger = logging.getLogger(__name__)
 # How many results to fetch per sub-question per source
 S2_LIMIT_PER_QUESTION = 4
 WEB_LIMIT_PER_QUESTION = 3
+# Sub-questions are retrieved concurrently. S2 calls still respect the
+# process-wide rate limiter in retriever_utils; set to 1 for the old
+# sequential behaviour.
+RETRIEVAL_WORKERS = int(os.environ.get("RECON_RETRIEVAL_WORKERS", "3"))
 
 def _to_search_query(question: str) -> str:
     """
@@ -67,10 +72,9 @@ def retriever_node(state: ResearchState) -> ResearchState:
     seen_paper_ids: set[str] = set()
     seen_urls: set[str] = set()
 
-    for i, question in enumerate(sub_questions):
+    def _retrieve_one(indexed_question):
+        i, question = indexed_question
         logger.info(f"Retriever: searching for sub-question {i+1}: {question[:60]}")
-
-        # --- Semantic Scholar ---
         s2_query = _to_search_query(question)
         logger.info(f"  S2 keyword query: '{s2_query}'")
         papers = search_semantic_scholar(
@@ -78,23 +82,26 @@ def retriever_node(state: ResearchState) -> ResearchState:
             limit=S2_LIMIT_PER_QUESTION,
             decay_config=decay_config,
         )
+        web_results = search_web(question, limit=WEB_LIMIT_PER_QUESTION)
+        return papers, web_results
+
+    # Fetch in parallel; pool.map returns results in sub-question order, so
+    # de-duplication below is deterministic and identical to the old loop.
+    workers = max(1, min(RETRIEVAL_WORKERS, len(sub_questions)))
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        per_question = list(pool.map(_retrieve_one, enumerate(sub_questions)))
+
+    for papers, web_results in per_question:
         for p in papers:
             if p.paper_id and p.paper_id not in seen_paper_ids:
                 seen_paper_ids.add(p.paper_id)
                 all_papers.append(p)
             elif not p.paper_id:
                 all_papers.append(p)
-
-        # --- Web search ---
-        web_results = search_web(question, limit=WEB_LIMIT_PER_QUESTION)
         for r in web_results:
             if r.url and r.url not in seen_urls:
                 seen_urls.add(r.url)
                 all_web.append(r)
-
-        # Small pause between sub-questions to be gentle on APIs
-        if i < len(sub_questions) - 1:
-            time.sleep(1)
 
     # --- Phase 2.2: OpenAlex augmentation ---
     from src.openalex_utils import search_openalex
@@ -102,9 +109,19 @@ def retriever_node(state: ResearchState) -> ResearchState:
     existing_ids = {p.paper_id for p in all_papers}
 
     if len(all_papers) < 12:
-        for question in sub_questions[:2]:  # only first 2 sub-questions
+        def _oa(question):
             try:
-                oa_results = search_openalex(question, max_results=3)
+                return search_openalex(question, max_results=3)
+            except Exception as e:
+                logger.warning(f"OpenAlex augmentation failed for '{question[:40]}': {e}")
+                return []
+
+        oa_questions = sub_questions[:2]  # only first 2 sub-questions
+        with ThreadPoolExecutor(max_workers=max(1, len(oa_questions))) as pool:
+            oa_batches = list(pool.map(_oa, oa_questions))
+
+        for question, oa_results in zip(oa_questions, oa_batches):
+            try:
                 for r in oa_results:
                     doi_lower = (r.get("doi") or "").lower()
                     pid = r.get("paper_id") or ""
@@ -136,7 +153,6 @@ def retriever_node(state: ResearchState) -> ResearchState:
                     all_papers.append(p)
                     existing_dois.add(doi_lower)
                     existing_ids.add(pid)
-                time.sleep(0.5)  # be polite to OpenAlex
             except Exception as e:
                 logger.warning(f"OpenAlex augmentation failed for '{question[:40]}': {e}")
                 continue

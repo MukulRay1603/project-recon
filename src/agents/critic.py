@@ -4,6 +4,7 @@ import re
 from datetime import datetime
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
+from src.llm_config import LLM_TIMEOUT_S, LLM_MAX_RETRIES
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from src.state import ResearchState, Paper, Verdict
@@ -19,7 +20,7 @@ _llm: ChatGroq | None = None
 def get_llm() -> ChatGroq:
     global _llm
     if _llm is None:
-        _llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.1)
+        _llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.1, timeout=LLM_TIMEOUT_S, max_retries=LLM_MAX_RETRIES)
     return _llm
 
 
@@ -101,6 +102,36 @@ def _detect_contradictions(papers: list[Paper]) -> list[tuple[str, str, str]]:
                 contradictions.append((older.title, newer.title, reason))
                 logger.info(f"Contradiction: '{older.title[:40]}' vs '{newer.title[:40]}'")
 
+    return contradictions
+
+
+# How many supporting / opposing papers to pair in the counter-evidence check.
+# 2 x 2 = at most 4 extra LLM calls per critic pass.
+COUNTER_TOP_SUPPORTING = 2
+COUNTER_TOP_OPPOSING = 2
+
+
+def _detect_counter_contradictions(
+    papers: list[Paper], opposing: list[Paper]
+) -> list[tuple[str, str, str]]:
+    """Pair the top supporting papers with the top papers from the
+    counter-evidence search. Unlike _detect_contradictions there is no 2-year
+    gap requirement: a critique can appear the same year as the paper it
+    critiques. We only require the opposing paper not to be *older*, since
+    the question asked of the LLM is "does B refute or supersede A?"."""
+    contradictions = []
+    for supporting in papers[:COUNTER_TOP_SUPPORTING]:
+        for opp in opposing[:COUNTER_TOP_OPPOSING]:
+            if (opp.year or 0) < (supporting.year or 0):
+                continue
+            if opp.paper_id and opp.paper_id == supporting.paper_id:
+                continue
+            contradicts, reason = _check_contradiction(supporting, opp)
+            if contradicts:
+                contradictions.append((supporting.title, opp.title, reason))
+                logger.info(
+                    f"Counter-evidence contradiction: '{supporting.title[:40]}' vs '{opp.title[:40]}'"
+                )
     return contradictions
 
 
@@ -214,6 +245,14 @@ def critic_node(state: ResearchState) -> ResearchState:
         is_stale = mean_age > 24
 
     contradictions = _detect_contradictions(papers)
+    # v2.1: also check against papers found by the counter-evidence search.
+    # Same LLM check, same verdict rule; only the candidate pairs are new.
+    opposing = state.get("opposing_papers") or []
+    if opposing:
+        already = {(c[0], c[1]) for c in contradictions}
+        for c in _detect_counter_contradictions(papers, opposing):
+            if (c[0], c[1]) not in already:
+                contradictions.append(c)
     is_contradicted = len(contradictions) > 0
 
     # --- Combine signals: CONTRADICTED wins when both fire ---

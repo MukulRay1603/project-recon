@@ -8,9 +8,9 @@ from datetime import datetime
 from typing import Optional
 
 from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
+# sentence-transformers / sklearn are imported lazily inside the functions
+# that need them, so importing this module (e.g. in unit tests or CI) does
+# not pull in torch.
 
 from src.state import Paper, WebResult
 
@@ -21,12 +21,16 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Embedding model — loaded once at module level (CPU, fast)
 # ---------------------------------------------------------------------------
-_embedder: Optional[SentenceTransformer] = None
+_embedder = None
+_embedder_lock = __import__("threading").Lock()
 
-def get_embedder() -> SentenceTransformer:
+def get_embedder():
     global _embedder
-    if _embedder is None:
-        _embedder = SentenceTransformer("all-MiniLM-L6-v2")
+    # Lock so parallel retrieval threads don't load the model twice.
+    with _embedder_lock:
+        if _embedder is None:
+            from sentence_transformers import SentenceTransformer
+            _embedder = SentenceTransformer("all-MiniLM-L6-v2")
     return _embedder
 
 
@@ -51,8 +55,11 @@ def _cache_get(key: str) -> Optional[list]:
 
 def _cache_set(key: str, data: list) -> None:
     path = os.path.join(_CACHE_DIR, f"{key}.json")
-    with open(path, "w") as f:
+    # Write-then-rename so a parallel reader never sees a half-written file.
+    tmp = f"{path}.{os.getpid()}.{id(data)}.tmp"
+    with open(tmp, "w") as f:
         json.dump(data, f)
+    os.replace(tmp, path)
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +109,90 @@ def hybrid_score(
 
 
 # ---------------------------------------------------------------------------
+# Semantic Scholar rate limiting + retry
+# ---------------------------------------------------------------------------
+import threading
+
+
+class RateLimiter:
+    """Process-wide minimum spacing between request *starts*.
+
+    Replaces the old fixed `time.sleep(3)` before every S2 call. The point is
+    that the spacing is shared across threads: when sub-questions are
+    retrieved in parallel, S2 requests still leave at most one per
+    `min_interval` seconds, while embedding, web search and OpenAlex work
+    overlap with the wait.
+    """
+
+    def __init__(self, min_interval: float, clock=time.monotonic, sleep=time.sleep):
+        self.min_interval = min_interval
+        self._clock = clock
+        self._sleep = sleep
+        self._lock = threading.Lock()
+        self._next_allowed = 0.0
+
+    def wait(self) -> None:
+        with self._lock:
+            now = self._clock()
+            start = max(now, self._next_allowed)
+            self._next_allowed = start + self.min_interval
+        delay = start - now
+        if delay > 0:
+            self._sleep(delay)
+
+
+def _default_s2_interval() -> float:
+    # S2 with an API key: 1 request/second. Without a key requests share a
+    # public pool, so keep the old conservative 3s spacing.
+    override = os.getenv("S2_MIN_INTERVAL")
+    if override:
+        return float(override)
+    return 1.05 if os.getenv("S2_API_KEY") else 3.0
+
+
+S2_RATE_LIMITER = RateLimiter(_default_s2_interval())
+S2_TIMEOUT = float(os.getenv("S2_TIMEOUT", "15"))
+S2_MAX_RETRIES = 3
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+
+def _get_with_retry(url, *, headers, params, timeout=S2_TIMEOUT,
+                    max_retries=S2_MAX_RETRIES, limiter=None, sleep=time.sleep, session=None):
+    """GET with rate limiting, timeout and exponential backoff on 429/5xx and
+    network errors. Honors Retry-After when present. Returns parsed JSON or
+    None after the last attempt fails (callers treat None as "no results")."""
+    import requests
+
+    limiter = limiter or S2_RATE_LIMITER
+    http = session or requests
+    for attempt in range(max_retries + 1):
+        limiter.wait()
+        try:
+            resp = http.get(url, headers=headers, params=params, timeout=timeout)
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as e:
+            logger.warning(f"S2 network error (attempt {attempt + 1}): {e}")
+            resp = None
+        if resp is not None:
+            if resp.status_code == 200:
+                return resp.json()
+            if resp.status_code not in RETRYABLE_STATUS:
+                logger.warning(f"S2 returned {resp.status_code}, not retrying")
+                return None
+            logger.warning(f"S2 returned {resp.status_code} (attempt {attempt + 1})")
+        if attempt == max_retries:
+            break
+        backoff = 2.0 ** attempt
+        retry_after = resp.headers.get("Retry-After") if resp is not None else None
+        if retry_after:
+            try:
+                backoff = max(backoff, float(retry_after))
+            except ValueError:
+                pass
+        sleep(min(backoff, 30.0))
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Semantic Scholar search
 # ---------------------------------------------------------------------------
 def search_semantic_scholar(
@@ -121,8 +212,6 @@ def search_semantic_scholar(
             logger.info(f"S2 cache hit: {query[:50]}")
             return [Paper(**p) for p in cached]
 
-    import requests
-
     s2_key = os.getenv("S2_API_KEY")
     headers = {"x-api-key": s2_key} if s2_key else {}
 
@@ -132,24 +221,20 @@ def search_semantic_scholar(
         "fields": "title,abstract,year,citationCount,authors,references,paperId,externalIds",
     }
 
-    time.sleep(3)  # rate limit guard
-
-    try:
-        response = requests.get(
-            "https://api.semanticscholar.org/graph/v1/paper/search",
-            headers=headers,
-            params=params,
-            timeout=15,
-        )
-        response.raise_for_status()
-        data = response.json()
-    except Exception as e:
-        logger.warning(f"S2 search failed for '{query}': {e}")
+    data = _get_with_retry(
+        "https://api.semanticscholar.org/graph/v1/paper/search",
+        headers=headers,
+        params=params,
+    )
+    if data is None:
+        logger.warning(f"S2 search failed for '{query}' after retries")
         return []
 
     raw_papers = data.get("data", [])
     if not raw_papers:
         return []
+
+    from sklearn.metrics.pairwise import cosine_similarity
 
     embedder = get_embedder()
     query_vec = embedder.encode([query])

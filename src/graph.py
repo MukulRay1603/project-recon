@@ -7,6 +7,7 @@ from src.state import ResearchState, Verdict
 from src.memory import init_db, load_session
 from src.agents.planner import planner_node
 from src.agents.retriever import retriever_node
+from src.agents.counter_evidence import counter_evidence_node
 from src.agents.critic import critic_node
 from src.agents.synthesizer import synthesizer_node
 
@@ -133,7 +134,7 @@ def build_graph() -> StateGraph:
     Build and compile the RECON LangGraph state machine.
 
     Flow:
-    session_loader → planner → retriever → critic
+    session_loader → planner → retriever → counter_evidence → critic
                                                ↓ PASS/FORCED_PASS
                                            synthesizer → END
                                                ↓ STALE/CONTRADICTED/INSUFFICIENT
@@ -145,6 +146,7 @@ def build_graph() -> StateGraph:
     graph.add_node("session_loader", session_loader_node)
     graph.add_node("planner", planner_node)
     graph.add_node("retriever", retriever_node)
+    graph.add_node("counter_evidence", counter_evidence_node)
     graph.add_node("critic", critic_node)
     graph.add_node("retry_retriever", retry_retriever_node)
     graph.add_node("synthesizer", synthesizer_node)
@@ -153,7 +155,8 @@ def build_graph() -> StateGraph:
     graph.set_entry_point("session_loader")
     graph.add_edge("session_loader", "planner")
     graph.add_edge("planner", "retriever")
-    graph.add_edge("retriever", "critic")
+    graph.add_edge("retriever", "counter_evidence")
+    graph.add_edge("counter_evidence", "critic")
 
     # Conditional routing after critic
     graph.add_conditional_edges(
@@ -199,6 +202,7 @@ def run_recon(
         "retrieved_papers": [],
         "citation_graph": {},
         "web_results": [],
+        "opposing_papers": [],
         "critic_verdict": "",
         "critic_notes": "",
         "rewritten_questions": [],

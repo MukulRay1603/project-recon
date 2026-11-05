@@ -32,6 +32,8 @@ import re
 
 logger = logging.getLogger(__name__)
 
+from src.llm_config import LLM_TIMEOUT_S, LLM_MAX_RETRIES  # noqa: E402
+
 CURRENT_YEAR = 2026
 
 # Reliability thresholds
@@ -130,6 +132,8 @@ Return ONLY the JSON array."""
             model="llama-3.3-70b-versatile",
             temperature=0.1,
             api_key=os.environ.get("GROQ_API_KEY"),
+            timeout=LLM_TIMEOUT_S,
+            max_retries=LLM_MAX_RETRIES,
         )
         response = llm.invoke([
             SystemMessage(content=system_prompt),
