@@ -1,6 +1,7 @@
 import logging
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
+from src.llm_config import LLM_TIMEOUT_S, LLM_MAX_RETRIES
 from langchain_core.messages import SystemMessage, HumanMessage
 
 from src.state import ResearchState, SessionContext
@@ -16,7 +17,7 @@ _llm: ChatGroq | None = None
 def get_llm() -> ChatGroq:
     global _llm
     if _llm is None:
-        _llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.2)
+        _llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.2, timeout=LLM_TIMEOUT_S, max_retries=LLM_MAX_RETRIES)
     return _llm
 
 
