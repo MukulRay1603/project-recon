@@ -1,5 +1,5 @@
 from src.agents import critic, planner, synthesizer
-from src.llm_config import LLM_TIMEOUT_S, LLM_MAX_RETRIES
+from src.llm_config import LLM_MAX_RETRIES, LLM_TIMEOUT_S
 
 
 def test_all_llm_clients_have_timeout_and_bounded_retries(monkeypatch):

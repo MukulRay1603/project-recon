@@ -1,7 +1,7 @@
 """Unit tests for counter-evidence retrieval. No network, no LLM."""
-from src.state import Paper
 from src.agents import counter_evidence as ce
 from src.agents import critic
+from src.state import Paper
 
 
 def _paper(pid, year=2020, title=None, score=0.5):

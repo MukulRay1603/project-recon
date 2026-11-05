@@ -2,7 +2,6 @@
 import threading
 import time
 
-import pytest
 import requests
 
 from src import retriever_utils as ru
@@ -142,7 +141,11 @@ def test_parallel_retrieval_is_faster_with_io_latency(monkeypatch):
     _fake_sources(monkeypatch, delay=0.1)
     state = {"sub_questions": ["a", "b", "c"]}
     monkeypatch.setattr(retriever, "RETRIEVAL_WORKERS", 1)
-    t0 = time.perf_counter(); retriever.retriever_node(dict(state)); seq = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    retriever.retriever_node(dict(state))
+    seq = time.perf_counter() - t0
     monkeypatch.setattr(retriever, "RETRIEVAL_WORKERS", 3)
-    t0 = time.perf_counter(); retriever.retriever_node(dict(state)); par = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    retriever.retriever_node(dict(state))
+    par = time.perf_counter() - t0
     assert par < seq * 0.6, (seq, par)

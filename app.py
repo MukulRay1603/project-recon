@@ -1,255 +1,335 @@
-import gradio as gr
-import uuid
-import os
-import tempfile
-import logging
-import preload
-from dotenv import load_dotenv
+"""RECON Gradio app.
 
-from src.graph import run_recon
-from src.memory import init_db, load_session
+Run locally:  python app.py
+The UI streams progress from the LangGraph pipeline (src.graph.stream_recon)
+so each agent's step, the critic's verdict and any retries are visible.
+"""
+import html
+import logging
+import os
+import re
+import tempfile
+import uuid
+
+import gradio as gr
+from dotenv import load_dotenv
 
 load_dotenv()
 logging.basicConfig(level=logging.WARNING)
 logger = logging.getLogger(__name__)
 
-init_db()
+try:  # warms the embedding model on Spaces; optional for local UI work
+    import preload  # noqa: F401
+except Exception as e:  # pragma: no cover
+    logger.warning(f"Embedding model preload skipped: {e}")
+
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Environment checks (shown to the user, never the key itself)
 # ---------------------------------------------------------------------------
 
-VERDICT_META = {
-    "PASS":        ("✅", "#22c55e", "Pass"),
-    "FORCED_PASS": ("⚠️", "#f59e0b", "Forced Pass"),
-    "STALE":       ("🕰️", "#f59e0b", "Stale"),
-    "CONTRADICTED":("⚡", "#ef4444", "Contradicted"),
-    "INSUFFICIENT":("📉", "#ef4444", "Insufficient"),
+def env_status() -> dict:
+    return {
+        "llm": bool(os.getenv("GROQ_API_KEY")),
+        "s2_key": bool(os.getenv("S2_API_KEY")),
+    }
+
+
+LLM_MISSING_MSG = (
+    "The language model is not configured, so RECON cannot plan, judge or write an answer. "
+    "Set GROQ_API_KEY in a local .env file (or in the Space secrets) and restart the app."
+)
+
+
+def friendly_error(e: Exception) -> str:
+    text = str(e)
+    low = text.lower()
+    if "api_key" in low or "401" in low or "invalid api key" in low or "authentication" in low:
+        return "The language model rejected the API key. Check GROQ_API_KEY and restart."
+    if "429" in low or "rate limit" in low:
+        return "A service is rate limiting requests right now. Wait a minute and try again."
+    if "timeout" in low or "timed out" in low:
+        return "A service took too long to respond. Try again, or try a shorter question."
+    if "connection" in low or "network" in low:
+        return "A network request failed. Check your connection and try again."
+    return "Something went wrong while running the pipeline."
+
+
+# ---------------------------------------------------------------------------
+# Rendering helpers (pure functions, unit tested)
+# ---------------------------------------------------------------------------
+
+def esc(x) -> str:
+    return html.escape(str(x if x is not None else ""))
+
+
+STEPS = [
+    ("planner", "Plan", "Split the question into sub-questions"),
+    ("retriever", "Retrieve", "Search Semantic Scholar, OpenAlex and the web"),
+    ("counter_evidence", "Counter-evidence", "Search for critiques and failed replications"),
+    ("critic", "Critic", "Score reliability, check staleness and contradictions"),
+    ("synthesizer", "Synthesize", "Write the answer with citations"),
+]
+
+VERDICT_INFO = {
+    "PASS": ("Pass", "ok", "The evidence passed the staleness and contradiction checks."),
+    "FORCED_PASS": ("Forced pass", "warn", "The retry limit was reached, so the answer uses the evidence available."),
+    "STALE": ("Stale", "warn", "Average reliability of the retrieved papers was low, so the critic asked for more recent work."),
+    "CONTRADICTED": ("Contradicted", "bad", "The critic's LLM check judged that one paper refutes or supersedes another."),
+    "INSUFFICIENT": ("Insufficient", "bad", "Too few relevant papers were found, so the critic broadened the search."),
 }
 
-CONF_META = {
-    "high":   ("🟢", "#22c55e"),
-    "medium": ("🟡", "#f59e0b"),
-    "low":    ("🔴", "#ef4444"),
-}
+SIGNAL_TONE = {"FOUNDATIONAL": "ok", "CURRENT": "info", "DECLINING": "warn", "SUPERSEDED": "bad"}
 
-def _highlight_citations(text: str) -> str:
-    """Wrap [Author et al., Year] citations in styled spans."""
-    import re
+
+def empty_html(text: str) -> str:
+    return f"<div class='rc-empty'>{esc(text)}</div>"
+
+
+def progress_html(events: list, running: str | None = None, failed: bool = False) -> str:
+    """events: list of (node, summary). running: node currently expected."""
+    done = {n for n, _ in events}
+    summaries = {}
+    for n, s in events:
+        summaries[n] = s  # last summary wins (critic may run more than once)
+    retries = sum(1 for n, _ in events if n == "retry_retriever")
+    items = []
+    for node, label, desc in STEPS:
+        if node in done:
+            state, icon = "done", "&#10003;"
+        elif node == running:
+            state, icon = ("failed", "!") if failed else ("running", "")
+        else:
+            state, icon = "pending", ""
+        detail = summaries.get(node) or desc
+        items.append(
+            f"<li class='rc-step rc-{state}'><span class='rc-dot'>{icon}</span>"
+            f"<div><div class='rc-step-label'>{esc(label)}</div>"
+            f"<div class='rc-step-detail'>{esc(detail)}</div></div></li>"
+        )
+    retry_note = ""
+    if retries:
+        retry_note = (f"<div class='rc-note'>The critic sent the search back {retries} "
+                      f"time{'s' if retries != 1 else ''} with rewritten queries.</div>")
+    return f"<ol class='rc-steps'>{''.join(items)}</ol>{retry_note}"
+
+
+def summarize_event(node: str, state: dict) -> str:
+    if node == "planner":
+        n = len(state.get("sub_questions") or [])
+        return f"{n} sub-question{'s' if n != 1 else ''}"
+    if node in ("retriever", "retry_retriever"):
+        p = len(state.get("retrieved_papers") or [])
+        w = len(state.get("web_results") or [])
+        return f"{p} papers, {w} web results"
+    if node == "counter_evidence":
+        n = len(state.get("opposing_papers") or [])
+        return f"{n} candidate opposing paper{'s' if n != 1 else ''}" if n else "No opposing papers found"
+    if node == "critic":
+        v = state.get("critic_verdict", "")
+        return f"Verdict: {VERDICT_INFO.get(v, (v,))[0]}"
+    if node == "synthesizer":
+        return "Answer written"
+    return ""
+
+
+def verdict_html(state: dict) -> str:
+    verdict = state.get("critic_verdict") or ""
+    if not verdict:
+        return empty_html("The critic's verdict and its reasons will appear here.")
+    label, tone, meaning = VERDICT_INFO.get(verdict, (verdict, "info", ""))
+    retries = state.get("retry_count", 0) or 0
+    notes = state.get("critic_notes") or ""
+    limit = ""
+    if retries >= 2 and verdict not in ("PASS", "FORCED_PASS"):
+        limit = "<p class='rc-note'>The retry limit was reached, so the answer was written from the evidence available.</p>"
+    rewritten = state.get("rewritten_questions") or []
+    rw = ""
+    if rewritten:
+        rw = ("<div class='rc-sub'>Rewritten queries for the next search</div><ul class='rc-list'>"
+              + "".join(f"<li>{esc(q)}</li>" for q in rewritten) + "</ul>")
+    latency = state.get("latency_ms") or 0
+    meta = [f"{len(state.get('retrieved_papers') or [])} papers",
+            f"{retries} retr{'ies' if retries != 1 else 'y'}"]
+    if latency:
+        meta.append(f"{latency / 1000:.1f} s")
+    return (
+        f"<div class='rc-card rc-tone-{tone}'>"
+        f"<div class='rc-verdict'><span class='rc-pill rc-tone-{tone}'>{esc(label)}</span>"
+        f"<span class='rc-meta'>{esc(' · '.join(meta))}</span></div>"
+        f"<p>{esc(meaning)}</p>"
+        + (f"<div class='rc-sub'>Critic notes</div><p class='rc-mono'>{esc(notes)}</p>" if notes else "")
+        + limit + rw + "</div>"
+    )
+
+
+def _signal(rs) -> str | None:
+    if not rs:
+        return None
+    return rs.get("dominant_signal") if isinstance(rs, dict) else getattr(rs, "dominant_signal", None)
+
+
+def paper_cards_html(papers, reliability_scores=None, notes: str = "", limit: int = 10,
+                     empty: str = "No papers yet.") -> str:
+    reliability_scores = reliability_scores or {}
+    if not papers:
+        return empty_html(empty)
+    cards = []
+    for p in papers[:limit]:
+        authors = ", ".join(p.authors[:2]) + (" et al." if len(p.authors) > 2 else "") if p.authors else "Unknown authors"
+        abstract = p.abstract or ""
+        if len(abstract) > 220:
+            abstract = abstract[:220].rsplit(" ", 1)[0] + "..."
+        badges = []
+        sig = _signal(reliability_scores.get(p.paper_id))
+        if sig:
+            badges.append(f"<span class='rc-pill rc-tone-{SIGNAL_TONE.get(sig, 'info')}'>{esc(sig.title())}</span>")
+        if notes and p.title and p.title in notes:
+            badges.append("<span class='rc-pill rc-tone-bad'>Named by critic</span>")
+        year = p.year or "n.d."
+        cards.append(
+            f"<div class='rc-paper'><div class='rc-paper-head'><div class='rc-paper-title'>{esc(p.title)}</div>"
+            f"<div class='rc-badges'>{''.join(badges)}</div></div>"
+            f"<div class='rc-meta'>{esc(authors)} · {esc(year)} · {p.citation_count:,} citations · "
+            f"score {p.hybrid_score:.2f}</div>"
+            f"<div class='rc-abstract'>{esc(abstract)}</div></div>"
+        )
+    more = f"<div class='rc-meta'>Showing {limit} of {len(papers)}.</div>" if len(papers) > limit else ""
+    return "".join(cards) + more
+
+
+def claims_html(claims) -> str:
+    if not claims:
+        return empty_html("Claims and their confidence will appear here after the answer is written.")
+    tone = {"high": "ok", "medium": "warn", "low": "bad"}
+    rows = "".join(
+        f"<tr><td><span class='rc-pill rc-tone-{tone.get(c.confidence, 'info')}'>{esc(c.confidence.title())}</span></td>"
+        f"<td>{esc(c.text)}{' <span class=rc-pill>Contested</span>' if c.flagged else ''}</td>"
+        f"<td>{esc(c.source_title)}</td><td>{esc(c.source_year)}</td></tr>"
+        for c in claims
+    )
+    return ("<div class='rc-table-wrap'><table class='rc-table'><thead><tr><th>Confidence</th><th>Claim</th>"
+            f"<th>Source</th><th>Year</th></tr></thead><tbody>{rows}</tbody></table></div>")
+
+
+def session_html(ctx, session_id: str) -> str:
+    queries = list(getattr(ctx, "prior_queries", []) or [])
+    if not queries:
+        return empty_html("No questions in this session yet. Follow-up questions reuse this session's context.")
+    items = "".join(f"<li>{esc(q)}</li>" for q in queries)
+    return (f"<div class='rc-meta'>Session {esc(session_id[:8])} · {len(queries)} question"
+            f"{'s' if len(queries) != 1 else ''}</div><ul class='rc-list'>{items}</ul>")
+
+
+def highlight_citations(text: str) -> str:
     return re.sub(
         r"(\[[A-Za-z][^,\[\]]{1,40},?\s*(?:et al\.?)?,?\s*\d{4}[a-z]?\])",
-        r'<span style="background:#1e3a5f;color:#93c5fd;padding:1px 5px;'
-        r'border-radius:4px;font-size:0.88em;font-weight:500">\1</span>',
-        text
+        r"**\1**",
+        text or "",
     )
-
-SIGNAL_COLORS = {
-    "FOUNDATIONAL": "#22c55e",
-    "CURRENT":      "#3b82f6",
-    "DECLINING":    "#f59e0b",
-    "SUPERSEDED":   "#ef4444",
-}
-
-def _paper_cards_html(papers, reliability_scores: dict = {}) -> str:
-    """Render retrieved papers as styled cards."""
-    if not papers:
-        return "<p style='color:#6b7280;font-style:italic'>No papers retrieved.</p>"
-
-    cards = []
-    for p in papers[:8]:
-        score_color = "#22c55e" if p.hybrid_score >= 0.6 else "#f59e0b" if p.hybrid_score >= 0.4 else "#ef4444"
-        authors = ", ".join(p.authors[:2]) + (" et al." if len(p.authors) > 2 else "") if p.authors else "Unknown"
-        abstract_preview = (p.abstract[:180] + "...") if p.abstract and len(p.abstract) > 180 else (p.abstract or "")
-
-        rs = reliability_scores.get(p.paper_id)
-        if rs:
-            dominant = rs.get("dominant_signal", "DECLINING") if isinstance(rs, dict) else rs.dominant_signal
-            sig_color = SIGNAL_COLORS.get(dominant, "#6b7280")
-            signal_badge = (
-                f'<span style="background:{sig_color}22;color:{sig_color};border:1px solid {sig_color}44;'
-                f'padding:2px 7px;border-radius:12px;font-size:0.75em;white-space:nowrap;font-weight:600;margin-left:6px">'
-                f'{dominant}</span>'
-            )
-        else:
-            signal_badge = ""
-
-        cards.append(f"""
-<div style="border:1px solid #2d3748;border-radius:8px;padding:12px 14px;
-            margin-bottom:8px;background:#1a1f2e;">
-  <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:4px">
-    <span style="font-weight:600;font-size:0.92em;color:#e2e8f0;flex:1;margin-right:8px">{p.title}</span>
-    <div style="display:flex;align-items:center;flex-shrink:0">
-      <span style="background:{score_color}22;color:{score_color};border:1px solid {score_color}44;
-                   padding:2px 8px;border-radius:12px;font-size:0.78em;white-space:nowrap;font-weight:600">
-        {p.hybrid_score:.3f}
-      </span>{signal_badge}
-    </div>
-  </div>
-  <div style="color:#94a3b8;font-size:0.8em;margin-bottom:6px">
-    {authors} · {p.year} · {p.citation_count:,} citations · <span style="color:#64748b">{p.source}</span>
-  </div>
-  <div style="color:#9ca3af;font-size:0.8em;line-height:1.5">{abstract_preview}</div>
-</div>""")
-
-    return "".join(cards)
-
-
-def _verdict_badge_html(verdict: str, notes: str, retry: int,
-                        papers: int, latency: float, decay: str,
-                        rewritten: list) -> str:
-    emoji, color, label = VERDICT_META.get(verdict, ("❓", "#6b7280", verdict))
-
-    rw_html = ""
-    if rewritten:
-        items = "".join(f"<li style='color:#94a3b8;font-size:0.82em'>{q}</li>" for q in rewritten)
-        rw_html = f"<div style='margin-top:10px'><div style='color:#64748b;font-size:0.78em;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px'>Rewritten queries</div><ul style='margin:0;padding-left:16px'>{items}</ul></div>"
-
-    return f"""
-<div style="border:1px solid {color}44;border-radius:10px;padding:14px 16px;background:{color}11;margin-bottom:12px">
-  <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px">
-    <span style="font-size:1.4em">{emoji}</span>
-    <span style="font-size:1.1em;font-weight:700;color:{color}">{label}</span>
-    <span style="margin-left:auto;color:#64748b;font-size:0.8em">{latency:.0f}ms</span>
-  </div>
-  <div style="color:#cbd5e1;font-size:0.88em;line-height:1.6;margin-bottom:8px">{notes}</div>
-  <div style="display:flex;gap:16px;flex-wrap:wrap">
-    <span style="color:#64748b;font-size:0.8em">📄 {papers} papers</span>
-    <span style="color:#64748b;font-size:0.8em">🔁 {retry} retries</span>
-    <span style="color:#64748b;font-size:0.8em">📐 {decay} decay</span>
-  </div>
-  {rw_html}
-</div>"""
-
-
-def _claims_html(claims) -> str:
-    if not claims:
-        return "<p style='color:#6b7280;font-style:italic'>No claims extracted.</p>"
-
-    rows = ""
-    for c in claims:
-        emoji, color = CONF_META.get(c.confidence, ("⚪", "#6b7280"))
-        flag = " <span title='Contested claim' style='color:#f59e0b'>⚠️</span>" if c.flagged else ""
-        rows += f"""
-<tr style="border-bottom:1px solid #2d3748">
-  <td style="padding:8px 10px;white-space:nowrap">
-    <span style="color:{color};font-weight:600;font-size:0.82em">{emoji} {c.confidence.upper()}</span>
-  </td>
-  <td style="padding:8px 10px;color:#e2e8f0;font-size:0.84em;line-height:1.5">{c.text}{flag}</td>
-  <td style="padding:8px 10px;color:#94a3b8;font-size:0.8em;white-space:nowrap">{c.source_title[:35]}...</td>
-  <td style="padding:8px 10px;color:#64748b;font-size:0.8em">{c.source_year}</td>
-</tr>"""
-
-    return f"""
-<table style="width:100%;border-collapse:collapse;font-family:inherit">
-  <thead>
-    <tr style="border-bottom:2px solid #374151">
-      <th style="padding:8px 10px;text-align:left;color:#6b7280;font-size:0.78em;text-transform:uppercase;letter-spacing:0.05em">Confidence</th>
-      <th style="padding:8px 10px;text-align:left;color:#6b7280;font-size:0.78em;text-transform:uppercase;letter-spacing:0.05em">Claim</th>
-      <th style="padding:8px 10px;text-align:left;color:#6b7280;font-size:0.78em;text-transform:uppercase;letter-spacing:0.05em">Source</th>
-      <th style="padding:8px 10px;text-align:left;color:#6b7280;font-size:0.78em;text-transform:uppercase;letter-spacing:0.05em">Year</th>
-    </tr>
-  </thead>
-  <tbody>{rows}</tbody>
-</table>"""
-
-
-def _session_html(session_ctx, session_id: str) -> str:
-    turns = len(session_ctx.prior_queries)
-    if turns == 0:
-        return f"<p style='color:#6b7280;font-size:0.85em'>Session <code>{session_id[:8]}...</code> — no turns yet.</p>"
-
-    items = "".join(
-        f"<li style='color:#94a3b8;font-size:0.83em;padding:3px 0;border-bottom:1px solid #2d3748'>{q[:70]}</li>"
-        for q in session_ctx.prior_queries
-    )
-
-    contradictions = ""
-    if session_ctx.flagged_contradictions:
-        c_items = "".join(
-            f"<li style='color:#fca5a5;font-size:0.8em;padding:2px 0'>{c[:80]}</li>"
-            for c in session_ctx.flagged_contradictions[:3]
-        )
-        contradictions = f"""
-<div style="margin-top:10px">
-  <div style="color:#ef4444;font-size:0.78em;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">⚡ Contradictions flagged</div>
-  <ul style="margin:0;padding-left:16px">{c_items}</ul>
-</div>"""
-
-    return f"""
-<div style="font-family:inherit">
-  <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
-    <code style="background:#1e293b;color:#7dd3fc;padding:2px 8px;border-radius:4px;font-size:0.82em">{session_id[:8]}...</code>
-    <span style="color:#64748b;font-size:0.82em">{turns} turn{"s" if turns != 1 else ""}</span>
-  </div>
-  <div style="color:#64748b;font-size:0.78em;text-transform:uppercase;letter-spacing:0.05em;margin-bottom:4px">Queries</div>
-  <ul style="margin:0;padding-left:16px">{items}</ul>
-  {contradictions}
-</div>"""
 
 
 # ---------------------------------------------------------------------------
-# Core pipeline runner
+# Pipeline runner (generator for streaming UI updates)
 # ---------------------------------------------------------------------------
 
-def run_query(query, session_id, decay_config, history):
-    if not query.strip():
-        yield history, session_id, "", "", "", "", "", None
+NODE_ORDER = ["planner", "retriever", "counter_evidence", "critic", "synthesizer"]
+
+
+def _next_node(node: str, state: dict) -> str | None:
+    if node == "critic":
+        v = state.get("critic_verdict")
+        if v in ("PASS", "FORCED_PASS") or (state.get("retry_count") or 0) >= 2:
+            return "synthesizer"
+        return "critic"  # retry retrieval, then the critic again
+    if node == "retry_retriever":
+        return "critic"
+    if node in NODE_ORDER and node != "synthesizer":
+        return NODE_ORDER[NODE_ORDER.index(node) + 1]
+    if node == "session_loader":
+        return "planner"
+    return None
+
+
+def run_query(query, session_id, decay_config, history, stream_fn=None, status=None):
+    """Yields tuples: (history, session_id, progress, verdict, papers, opposing, claims, session, export_md)."""
+    status = status or env_status()
+    history = list(history or [])
+    query = (query or "").strip()
+    session_id = session_id or str(uuid.uuid4())
+    blank = (empty_html("No papers yet."), empty_html("No counter-evidence yet."))
+
+    if not query:
+        yield (history, session_id, progress_html([]), verdict_html({}), *blank,
+               claims_html([]), gr.update(), gr.update())
         return
 
-    if not session_id.strip():
-        session_id = str(uuid.uuid4())
+    history.append({"role": "user", "content": query})
 
-    history = history + [{"role": "user", "content": query}]
-    yield history, session_id, \
-        _verdict_badge_html("", "🔍 Running pipeline...", 0, 0, 0, decay_config, []), \
-        "", "", "", "", None
+    if not status["llm"]:
+        history.append({"role": "assistant", "content": LLM_MISSING_MSG})
+        err = f"<div class='rc-card rc-tone-bad'><p>{esc(LLM_MISSING_MSG)}</p></div>"
+        yield (history, session_id, progress_html([], running="planner", failed=True), err, *blank,
+               claims_html([]), gr.update(), gr.update())
+        return
 
+    if stream_fn is None:
+        from src.graph import stream_recon as stream_fn
+
+    events: list = []
+    state: dict = {}
+    running = "planner"
+    yield (history, session_id, progress_html(events, running), empty_html("Waiting for the critic..."),
+           *blank, claims_html([]), gr.update(), gr.update())
     try:
-        result = run_recon(query=query, session_id=session_id, decay_config=decay_config)
+        for node, state in stream_fn(query=query, session_id=session_id, decay_config=decay_config):
+            if node == "__done__":
+                break
+            if node != "session_loader":
+                events.append((node, summarize_event(node, state)))
+            running = _next_node(node, state)
+            yield (history, session_id, progress_html(events, running), verdict_html(state),
+                   paper_cards_html(state.get("retrieved_papers"), state.get("paper_reliability_scores"),
+                                    state.get("critic_notes", "")),
+                   blank[1], claims_html([]), gr.update(), gr.update())
     except Exception as e:
-        logger.error(f"Pipeline error: {e}")
-        history = history + [{"role": "assistant", "content": f"❌ Error: {e}"}]
-        yield history, session_id, f"<p style='color:#ef4444'>❌ {e}</p>", "", "", "", "", None
+        logger.exception("Pipeline error")
+        msg = friendly_error(e)
+        history.append({"role": "assistant", "content": msg})
+        err = (f"<div class='rc-card rc-tone-bad'><p>{esc(msg)}</p>"
+               f"<p class='rc-meta'>Details: {esc(type(e).__name__)}: {esc(str(e)[:200])}</p></div>")
+        yield (history, session_id, progress_html(events, running, failed=True), err,
+               paper_cards_html(state.get("retrieved_papers")), blank[1], claims_html([]),
+               gr.update(), gr.update())
         return
 
-    position = result.get("synthesized_position", "No position generated.")
-    highlighted = _highlight_citations(position)
-    history = history + [{"role": "assistant", "content": highlighted}]
-
-    verdict       = result.get("critic_verdict", "N/A")
-    critic_notes  = result.get("critic_notes", "")
-    retry_count   = result.get("retry_count", 0)
-    latency       = result.get("latency_ms", 0)
-    papers_used   = len(result.get("retrieved_papers") or [])
-    rewritten     = result.get("rewritten_questions") or []
-
-    verdict_html  = _verdict_badge_html(verdict, critic_notes, retry_count,
-                                         papers_used, latency, decay_config, rewritten)
-    claims_html   = _claims_html(result.get("claim_confidences") or [])
-    papers_html   = _paper_cards_html(result.get("retrieved_papers") or [], result.get("paper_reliability_scores") or {})
-    session_ctx   = load_session(session_id)
-    session_html  = _session_html(session_ctx, session_id)
-    export_md     = result.get("export_md", "")
-
-    yield history, session_id, verdict_html, claims_html, papers_html, session_html, export_md, None
+    answer = state.get("synthesized_position") or "No answer was generated."
+    history.append({"role": "assistant", "content": highlight_citations(answer)})
+    try:
+        from src.memory import load_session
+        sess = session_html(load_session(session_id), session_id)
+    except Exception:
+        sess = empty_html("Session memory is unavailable.")
+    opposing_note = ("<p class='rc-note'>Found by a search for critiques and replications. The critic checks these "
+                     "against the top papers. Being listed here does not mean a contradiction was found. "
+                     "They are not used in the staleness score.</p>")
+    opp = state.get("opposing_papers") or []
+    yield (history, session_id, progress_html(events, None), verdict_html(state),
+           paper_cards_html(state.get("retrieved_papers"), state.get("paper_reliability_scores"),
+                            state.get("critic_notes", "")),
+           opposing_note + paper_cards_html(opp, notes=state.get("critic_notes", ""),
+                                            empty="No counter-evidence candidates were found for this question.")
+           if opp else empty_html("No counter-evidence candidates were found for this question."),
+           claims_html(state.get("claim_confidences")), sess, state.get("export_md", ""))
 
 
 def export_md_file(export_md_content, session_id):
-    if not export_md_content.strip():
-        return None
-    try:
-        path = os.path.join(tempfile.gettempdir(), f"recon_{session_id[:8]}.md")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(export_md_content)
-        return path
-    except Exception as e:
-        logger.error(f"Export failed: {e}")
-        return None
-
-
-def new_session():
-    new_id = str(uuid.uuid4())
-    return new_id, [], "", "", "", "", "", None
+    if not (export_md_content or "").strip():
+        return gr.update(value=None, visible=False)
+    path = os.path.join(tempfile.gettempdir(), f"recon_{(session_id or 'session')[:8]}.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(export_md_content)
+    return gr.update(value=path, visible=True)
 
 
 # ---------------------------------------------------------------------------
@@ -257,126 +337,157 @@ def new_session():
 # ---------------------------------------------------------------------------
 
 CSS = """
-.gradio-container { font-family: 'Inter', system-ui, sans-serif !important; }
-.chatbot-wrap .message-wrap { font-size: 0.92em; line-height: 1.7; }
+
+:root { --rc-muted: #475569; } .dark { --rc-muted: #a3b1c6; }
 footer { display: none !important; }
+.rc-header h1 { margin: 0; font-size: 1.6rem; font-weight: 700; color: var(--body-text-color); }
+.rc-header p { margin: 4px 0 0; color: var(--rc-muted); font-size: 0.95rem; max-width: 70ch; }
+.rc-chips { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 10px; }
+.rc-chips .rc-pill { white-space: normal; }
+.rc-banner { border: 1px dashed #b45309; background: rgba(245,158,11,0.12); color: var(--body-text-color);
+  padding: 8px 12px; border-radius: 8px; margin-top: 10px; font-weight: 600; }
+.rc-section { font-size: 0.8rem; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--rc-muted); margin: 4px 0 6px; }
+.rc-empty { color: var(--rc-muted); font-size: 0.9rem; padding: 10px 2px; }
+.rc-pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 0.78rem; font-weight: 600;
+  border: 1px solid var(--block-border-color); color: var(--body-text-color); white-space: nowrap; }
+.rc-tone-ok { --tone: #15803d; } .rc-tone-info { --tone: #1d4ed8; }
+.rc-tone-warn { --tone: #b45309; } .rc-tone-bad { --tone: #b91c1c; }
+.dark .rc-tone-ok { --tone: #4ade80; } .dark .rc-tone-info { --tone: #93c5fd; }
+.dark .rc-tone-warn { --tone: #fbbf24; } .dark .rc-tone-bad { --tone: #f87171; }
+.rc-pill[class*="rc-tone-"] { color: var(--tone); border-color: var(--tone);
+  background: color-mix(in srgb, var(--tone) 10%, transparent); }
+.rc-card { border: 1px solid var(--block-border-color); border-left: 4px solid var(--tone, #64748b);
+  border-radius: 8px; padding: 12px 14px; color: var(--body-text-color); }
+.rc-card p { margin: 6px 0; line-height: 1.5; font-size: 0.92rem; }
+.rc-verdict { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.rc-verdict .rc-pill { font-size: 0.95rem; padding: 3px 12px; }
+.rc-meta { color: var(--rc-muted); font-size: 0.82rem; }
+.rc-sub { font-size: 0.78rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em;
+  color: var(--rc-muted); margin-top: 10px; }
+.rc-mono { font-size: 0.85rem !important; overflow-wrap: anywhere; }
+.rc-note { color: var(--rc-muted); font-size: 0.85rem; margin: 8px 0; }
+.rc-list { margin: 4px 0 0; padding-left: 18px; font-size: 0.88rem; color: var(--body-text-color); }
+.rc-steps { list-style: none; padding: 0; margin: 0; }
+.rc-step { display: flex; gap: 10px; align-items: flex-start; padding: 6px 0; }
+.rc-dot { flex: 0 0 22px; height: 22px; border-radius: 50%; border: 2px solid var(--block-border-color);
+  display: flex; align-items: center; justify-content: center; font-size: 0.75rem; font-weight: 700; }
+.rc-done .rc-dot { background: #15803d; border-color: #15803d; color: #fff; }
+.rc-running .rc-dot { border-color: #1d4ed8; border-top-color: transparent; animation: rc-spin 0.9s linear infinite; }
+.rc-failed .rc-dot { background: #b91c1c; border-color: #b91c1c; color: #fff; }
+.rc-pending .rc-step-label { color: var(--rc-muted); }
+.rc-step-label { font-weight: 600; font-size: 0.92rem; color: var(--body-text-color); }
+.rc-step-detail { font-size: 0.82rem; color: var(--rc-muted); }
+@keyframes rc-spin { to { transform: rotate(360deg); } }
+.rc-paper { border: 1px solid var(--block-border-color); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+.rc-paper-head { display: flex; gap: 8px; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; }
+.rc-paper-title { font-weight: 600; color: var(--body-text-color); flex: 1 1 260px; }
+.rc-badges { display: flex; gap: 6px; flex-wrap: wrap; }
+.rc-abstract { font-size: 0.86rem; color: var(--rc-muted); line-height: 1.5; margin-top: 4px; }
+.rc-table-wrap { overflow-x: auto; }
+.rc-table { width: 100%; border-collapse: collapse; font-size: 0.88rem; color: var(--body-text-color); }
+.rc-table th { text-align: left; font-size: 0.78rem; text-transform: uppercase; color: var(--rc-muted);
+  border-bottom: 1px solid var(--block-border-color); padding: 6px 8px; }
+.rc-table td { border-bottom: 1px solid var(--block-border-color); padding: 8px; vertical-align: top; }
 """
 
-with gr.Blocks(title="RECON") as demo:
+EXAMPLES = [
+    "What is the current state of KV cache compression for long-context LLMs?",
+    "Is speculative decoding lossless in practice?",
+    "What superseded RLHF with PPO for aligning language models?",
+    "Does quantization to 4 bits hurt LLM reasoning ability?",
+]
 
-    gr.HTML("""
-<div style="padding:20px 0 10px;border-bottom:1px solid #2d3748;margin-bottom:20px">
-  <div style="display:flex;align-items:center;gap:12px;margin-bottom:6px">
-    <span style="font-size:1.6em">🔍</span>
-    <h1 style="margin:0;font-size:1.5em;font-weight:700;color:#f1f5f9">RECON</h1>
-    <span style="background:#1e3a5f;color:#93c5fd;padding:3px 10px;border-radius:12px;
-                 font-size:0.75em;font-weight:600;letter-spacing:0.04em">MULTI-AGENT</span>
-  </div>
-  <p style="margin:0;color:#64748b;font-size:0.88em">
-    Temporally-aware ML literature research · Live Semantic Scholar · Staleness detection · Contradiction flagging
-  </p>
-</div>
-""")
 
-    session_id_state = gr.State(str(uuid.uuid4()))
-    export_md_state  = gr.State("")
+def header_html(status: dict, banner: str | None = None) -> str:
+    llm = ("<span class='rc-pill rc-tone-ok'>Language model ready</span>" if status["llm"]
+           else "<span class='rc-pill rc-tone-bad'>Language model not configured: set GROQ_API_KEY</span>")
+    s2 = ("<span class='rc-pill rc-tone-ok'>Semantic Scholar key set</span>" if status["s2_key"]
+          else "<span class='rc-pill rc-tone-warn'>No Semantic Scholar key: slower public rate limit</span>")
+    ban = f"<div class='rc-banner'>{esc(banner)}</div>" if banner else ""
+    return (
+        "<div class='rc-header'><h1>RECON</h1>"
+        "<p>Research assistant for ML literature. It retrieves papers, checks whether the evidence is stale "
+        "or contradicted, and writes a cited answer. Each paper gets a reliability label.</p>"
+        f"<div class='rc-chips'>{llm}{s2}</div>{ban}</div>"
+    )
 
-    with gr.Row(equal_height=False):
 
-        # ── Left column ──────────────────────────────────────────────────
-        with gr.Column(scale=3):
+def build_demo(stream_fn=None, status=None, banner: str | None = None) -> gr.Blocks:
+    status = status or env_status()
 
-            chatbot = gr.Chatbot(
-                label="Research Position",
-                height=480,
-                render_markdown=True,
-                elem_classes=["chatbot-wrap"],
-            )
+    with gr.Blocks(title="RECON") as demo:
+        gr.HTML(header_html(status, banner))
+        session_id_state = gr.State("")
+        export_md_state = gr.State("")
 
-            with gr.Row():
+        with gr.Row(equal_height=False):
+            with gr.Column(scale=3, min_width=280):
+                chatbot = gr.Chatbot(
+                    label="Answer",
+                    height=440,
+                    render_markdown=True,
+                    placeholder="Ask a research question. RECON shows each step as it runs, "
+                                "then answers with citations.",
+                )
                 query_input = gr.Textbox(
-                    placeholder="e.g. What is the current state of KV cache compression in LLMs?",
-                    label="Research Query",
+                    placeholder="Ask about an ML research topic",
+                    label="Research question",
                     lines=2,
-                    scale=4,
+                    max_lines=5,
                 )
-                submit_btn = gr.Button("🔍 Research", variant="primary", scale=1, min_width=120)
+                with gr.Row():
+                    submit_btn = gr.Button("Research", variant="primary", scale=3)
+                    new_session_btn = gr.Button("New session", variant="secondary", scale=1, min_width=120)
+                gr.Examples(EXAMPLES, inputs=query_input, label="Example questions")
+                with gr.Accordion("Settings", open=False):
+                    decay_dropdown = gr.Dropdown(
+                        choices=["linear", "log", "none"], value="linear",
+                        label="Recency decay used in paper ranking",
+                    )
 
-            with gr.Row():
-                decay_dropdown = gr.Dropdown(
-                    choices=["linear", "log", "none"],
-                    value="linear",
-                    label="Recency decay",
-                    scale=1,
-                )
-                new_session_btn = gr.Button("🔄 New Session", scale=1)
-                session_display = gr.Textbox(
-                    label="Session ID",
-                    interactive=False,
-                    scale=2,
-                )
+            with gr.Column(scale=2, min_width=260):
+                gr.HTML("<div class='rc-section'>Pipeline</div>")
+                progress_output = gr.HTML(progress_html([]))
+                gr.HTML("<div class='rc-section'>Critic verdict</div>")
+                verdict_output = gr.HTML(verdict_html({}))
 
-            with gr.Accordion("📄 Retrieved Papers", open=False):
-                papers_output = gr.HTML(
-                    value="<p style='color:#6b7280;font-style:italic;padding:8px'>Run a query to see retrieved papers.</p>"
-                )
+        with gr.Tabs():
+            with gr.Tab("Papers used"):
+                papers_output = gr.HTML(empty_html("Papers will appear here, each with a reliability label."))
+            with gr.Tab("Counter-evidence"):
+                opposing_output = gr.HTML(empty_html("Candidate opposing papers will appear here."))
+            with gr.Tab("Claims"):
+                claims_output = gr.HTML(claims_html([]))
+            with gr.Tab("Session"):
+                session_output = gr.HTML(empty_html("No questions in this session yet."))
+                export_btn = gr.Button("Export session as Markdown", variant="secondary")
+                export_file = gr.File(label="Download", visible=False)
 
-            with gr.Accordion("📊 Claim Confidence Table", open=True):
-                claims_output = gr.HTML(
-                    value="<p style='color:#6b7280;font-style:italic;padding:8px'>Run a query to see claim confidence scores.</p>"
-                )
+        outputs = [chatbot, session_id_state, progress_output, verdict_output, papers_output,
+                   opposing_output, claims_output, session_output, export_md_state]
 
-        # ── Right column ─────────────────────────────────────────────────
-        with gr.Column(scale=2):
+        def on_submit(query, session_id, decay_config, history):
+            yield from run_query(query, session_id, decay_config, history, stream_fn=stream_fn, status=status)
 
-            gr.HTML("<div style='color:#94a3b8;font-size:0.78em;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px'>Critic Debug Panel</div>")
-            critic_output = gr.HTML(
-                value="<p style='color:#6b7280;font-style:italic;font-size:0.88em'>Critic verdict will appear here.</p>"
-            )
+        for trigger in (submit_btn.click, query_input.submit):
+            trigger(on_submit, [query_input, session_id_state, decay_dropdown, chatbot], outputs,
+                    concurrency_limit=2).then(lambda: "", None, query_input)
 
-            gr.HTML("<hr style='border-color:#2d3748;margin:14px 0'>")
+        def new_session():
+            return ([], str(uuid.uuid4()), progress_html([]), verdict_html({}),
+                    empty_html("Papers will appear here, each with a reliability label."),
+                    empty_html("Candidate opposing papers will appear here."), claims_html([]),
+                    empty_html("No questions in this session yet."), "", gr.update(value=None, visible=False))
 
-            gr.HTML("<div style='color:#94a3b8;font-size:0.78em;text-transform:uppercase;letter-spacing:0.06em;margin-bottom:6px'>Session Memory</div>")
-            session_output = gr.HTML(
-                value="<p style='color:#6b7280;font-style:italic;font-size:0.88em'>Session history will appear here.</p>"
-            )
+        new_session_btn.click(new_session, None, outputs + [export_file])
+        export_btn.click(export_md_file, [export_md_state, session_id_state], export_file)
 
-            gr.HTML("<hr style='border-color:#2d3748;margin:14px 0'>")
+    return demo
 
-            export_btn  = gr.Button("📥 Export Session (.md)", variant="secondary")
-            export_file = gr.File(label="Download")
 
-    # ── Events ───────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    from src.memory import init_db
 
-    def on_submit(query, session_id, decay_config, history):
-        for r in run_query(query, session_id, decay_config, history):
-            chat, sid, critic, claims, papers, session, export_md, _ = r
-            yield chat, sid, critic, claims, papers, session, export_md, sid
-
-    submit_btn.click(
-        fn=on_submit,
-        inputs=[query_input, session_id_state, decay_dropdown, chatbot],
-        outputs=[chatbot, session_id_state, critic_output, claims_output,
-                 papers_output, session_output, export_md_state, session_display],
-    )
-
-    query_input.submit(
-        fn=on_submit,
-        inputs=[query_input, session_id_state, decay_dropdown, chatbot],
-        outputs=[chatbot, session_id_state, critic_output, claims_output,
-                 papers_output, session_output, export_md_state, session_display],
-    )
-
-    new_session_btn.click(
-        fn=new_session,
-        outputs=[session_id_state, chatbot, critic_output, claims_output,
-                 papers_output, session_output, export_md_state, export_file],
-    )
-
-    export_btn.click(
-        fn=export_md_file,
-        inputs=[export_md_state, session_id_state],
-        outputs=[export_file],
-    )
-
-demo.launch()
+    init_db()
+    build_demo().launch(css=CSS)
