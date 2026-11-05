@@ -8,9 +8,9 @@ from datetime import datetime
 from typing import Optional
 
 from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
+# sentence-transformers / sklearn are imported lazily inside the functions
+# that need them, so importing this module (e.g. in unit tests or CI) does
+# not pull in torch.
 
 from src.state import Paper, WebResult
 
@@ -21,11 +21,12 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Embedding model — loaded once at module level (CPU, fast)
 # ---------------------------------------------------------------------------
-_embedder: Optional[SentenceTransformer] = None
+_embedder = None
 
-def get_embedder() -> SentenceTransformer:
+def get_embedder():
     global _embedder
     if _embedder is None:
+        from sentence_transformers import SentenceTransformer
         _embedder = SentenceTransformer("all-MiniLM-L6-v2")
     return _embedder
 
@@ -150,6 +151,8 @@ def search_semantic_scholar(
     raw_papers = data.get("data", [])
     if not raw_papers:
         return []
+
+    from sklearn.metrics.pairwise import cosine_similarity
 
     embedder = get_embedder()
     query_vec = embedder.encode([query])

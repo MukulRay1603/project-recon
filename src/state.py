@@ -83,6 +83,7 @@ class ResearchState(TypedDict):
     retrieved_papers: list[Paper]
     citation_graph: dict                  # {paper_id: [cited_paper_ids]}
     web_results: list[WebResult]
+    opposing_papers: list[Paper]          # v2.1 — counter-evidence search, used only by the critic
 
     # --- Critic output ---
     critic_verdict: str                   # one of Verdict constants
