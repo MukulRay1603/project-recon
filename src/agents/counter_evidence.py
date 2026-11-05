@@ -57,12 +57,31 @@ def is_enabled() -> bool:
     return os.environ.get("RECON_COUNTER_EVIDENCE", "1").strip() not in ("0", "false", "no")
 
 
-def _keywords(question: str, max_words: int = 4) -> str:
-    """Reuse the retriever's keyword extraction, then trim further so the
-    critique term still carries weight in the query."""
-    from src.agents.retriever import _to_search_query
+# Words that carry no topic: question scaffolding, and the "is there
+# consensus / do experts agree" framing common in contested-claim questions.
+_STOPWORDS = set("""
+a an the of in on for to and or with by from at as is are was were be been
+do does did can could should would will what which who whom whose when where
+why how whether there their this that these those it its about into than
+any all some most more less meaningfully really actually practice
+consensus agree agreement agreed disagree debate debated experts researchers
+community field literature current currently state open problems challenges
+recent advances foundational papers paper research studies study evidence
+llm llms model models
+""".split())
 
-    return " ".join(_to_search_query(question).split()[:max_words])
+
+def _keywords(question: str, max_words: int = 5) -> str:
+    """Topic keywords for a counter-evidence query.
+
+    Uses whole-word stopword removal. (The main retriever's _to_search_query
+    does substring replacement, which mangles words like "there" -> "re";
+    that function is left untouched here so main-retrieval results, and
+    therefore the staleness metric, stay comparable with the README.)
+    """
+    tokens = re.findall(r"[a-z0-9][a-z0-9\-]*", (question or "").lower())
+    content = [t for t in tokens if t not in _STOPWORDS and len(t) > 1]
+    return " ".join(content[:max_words])
 
 
 _POSITIVE_TO_NEGATIVE = [

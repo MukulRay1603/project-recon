@@ -31,6 +31,12 @@ def test_build_counter_queries_adds_critique_terms_and_caps():
     assert len(set(qs)) == len(qs)
 
 
+def test_keywords_use_whole_word_stopwords():
+    # "there"/"whether" must be dropped whole, not turned into "re"/"whe"
+    q = "Is there consensus on whether KV cache compression degrades reasoning in LLMs?"
+    assert ce._keywords(q) == "kv cache compression degrades reasoning"
+
+
 def test_build_counter_queries_falls_back_to_original_query():
     qs = ce.build_counter_queries("KV cache compression", [])
     assert qs and "kv cache compression" in qs[0]
@@ -44,7 +50,7 @@ def test_node_excludes_supporting_papers_and_dedupes(monkeypatch):
         return [_paper("support-1"), _paper("opp-1", 2022), _paper("opp-2", 2023, score=0.9)]
 
     monkeypatch.setattr("src.retriever_utils.search_semantic_scholar", fake_search)
-    state = {"original_query": "x improves y", "sub_questions": ["a b c", "d e f"],
+    state = {"original_query": "x improves y", "sub_questions": ["dropout regularization", "batch normalization"],
              "retrieved_papers": [_paper("support-1")]}
     out = ce.counter_evidence_node(state)
     ids = [p.paper_id for p in out["opposing_papers"]]
